@@ -1,6 +1,7 @@
 from pathlib import Path
 from tqdm import tqdm
 import itk
+import numpy as np
 from typing import Literal
 
 class Preprocess:
@@ -8,7 +9,7 @@ class Preprocess:
         self,
         input_root: Path,
         output_root: Path,
-        num_workers: int = 8,
+        num_workers: int = 1,
         pipeline_version: str = "0.0.1",
         output_format: Literal["nii", "nii.gz"] = "nii.gz",
         voxel_size: tuple[float, float, float] = (1, 1, 1),
@@ -16,8 +17,7 @@ class Preprocess:
         for name, value in locals().items():
             if name != "self":
                 setattr(self, name, value)
-        
-    
+
     def resample_image_and_convert_to_nii(self, user_id):
         """
         Resample a 3D image to the specified voxel size and convert to NIfTI format. Returns the resampled image (in itk format).
@@ -82,6 +82,7 @@ class Preprocess:
         with open(output_metadata_path, 'w') as f:
             json.dump(metadata, f, indent=4)
 
+
     def run(self):
         """
         Main function to run the preprocessing:
@@ -100,13 +101,13 @@ class Preprocess:
 
         for series_id in tqdm(series_ids, desc="Processing series"):
             resampled_image = self.resample_image_and_convert_to_nii(series_id)
+
             output_path = output_series_dir / f"{series_id}.{self.output_format}"
             itk.imwrite(resampled_image, str(output_path))
 
-
 Preprocess(
-    input_root=Path("../ct_subset"),
-    output_root=Path("../ct_preprocessed"),
+    input_root=Path("ct_subset"),
+    output_root=Path("ct_preprocessed"),
     voxel_size=(1, 1, 1),
     output_format="nii.gz",
     num_workers=8,
