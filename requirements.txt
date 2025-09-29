@@ -1,0 +1,10 @@
+# Core scientific stack
+numpy>=1.23
+pandas>=1.5
+
+# Medical imaging IO and resampling
+itk>=5.3
+
+# Visualisation and progress helpers
+matplotlib>=3.6
+tqdm>=4.64
