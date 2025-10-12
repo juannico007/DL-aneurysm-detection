@@ -4,7 +4,7 @@ from typing import Optional, Literal
 import multiprocessing
 import pandas as pd
 import itk
-from .resample import resample_to_spacing
+from .resample import resample_to_spacing, resample_to_size
 from .registry import REGISTRY
 from .policy import ModalityPolicy
 
@@ -43,6 +43,7 @@ class Preprocess:
         pipeline_version: str = "0.0.1",
         output_format: Literal["nii", "nii.gz"] = "nii.gz",
         voxel_size: tuple[float, float, float] = (1, 1, 1),
+        shape : tuple[int, int, int] = (256, 256, 256),
         oversub_factor: float = 1.5,
     ):
         """Store configuration and derive worker/thread allocation."""
@@ -51,6 +52,7 @@ class Preprocess:
         self.pipeline_version = pipeline_version
         self.output_format = output_format
         self.voxel_size = voxel_size
+        self.shape = shape
         self.oversub_factor = oversub_factor
 
         total_cores = multiprocessing.cpu_count()
@@ -86,8 +88,7 @@ class Preprocess:
             Absolute path to the written preprocessed volume file.
         """
         # 1) read + resample
-        image = resample_to_spacing(self.input_root, series_id, self.voxel_size)
-
+        image = resample_to_size(self.input_root, series_id, self.shape)
         # 2) pick policy
         policy_cls = REGISTRY.get((modality or "").upper(), ModalityPolicy)
         policy: ModalityPolicy = policy_cls()
@@ -98,9 +99,9 @@ class Preprocess:
             "voxel_size": self.voxel_size,
             "pipeline_version": self.pipeline_version,
         }
-
+        
+        #image = policy.crop(image, ctx)
         image = policy.pre_hooks(image, ctx)
-        image = policy.crop(image, ctx)
         image = policy.normalize(image, ctx)
         image = policy.post_hooks(image, ctx)
 

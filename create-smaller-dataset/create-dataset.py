@@ -29,7 +29,7 @@ def copy_subset(folder_path, out_path, modality="CTA", n_series=20, workers=8, s
     """
     Copy a subset of series folders based on the specified modality and number of series.
     """
-
+   
     train_csv = folder_path + "/train.csv"
     images = folder_path + "/series"
     OUT = Path(out_path)
@@ -69,9 +69,9 @@ def copy_subset(folder_path, out_path, modality="CTA", n_series=20, workers=8, s
 
 copy_subset(
     folder_path="../data/rsna-intracranial-aneurysm-detection",
-    out_path="mini-rsna-intracranial-aneurysm-detection",
+    out_path="../all_cta",
     modality="CTA",
-    n_series=20,
+    n_series=100,
     workers=8,
     see_size=True
 )
