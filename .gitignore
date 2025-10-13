@@ -225,6 +225,7 @@ datasets/
 *.nii
 *.nii.gz
 *.dcm
+*.nii.npy
 
 # ------------------------
 # IDE & OS
