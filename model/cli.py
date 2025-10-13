@@ -6,8 +6,8 @@ import numpy as np
 import random
 from scipy import ndimage
 import tensorflow as tf
-import keras
-from keras import layers
+from .model import AneurysmDetectionModel
+from .data_augmentation import DataAugmentation
 
 def process_scan(path):
     cache_dir = Path("cache")
@@ -23,58 +23,6 @@ def process_scan(path):
 
     np.save(cache_path, volume)
     return volume
-
-def rotate(volume):
-    def scipy_rotate(volume):
-        angles = [-20, -10, -5, 5, 10, 20]
-        angle = random.choice(angles)
-        volume = ndimage.rotate(volume, angle, reshape=False)
-        volume[volume < 0] = 0
-        volume[volume > 1] = 1
-        return volume
-
-    augmented_volume = tf.numpy_function(scipy_rotate, [volume], tf.float32)
-    return augmented_volume
-
-
-def train_preprocessing(volume, label):
-    volume = rotate(volume)
-    volume = tf.expand_dims(volume, axis=-1)
-    return volume, label
-
-
-def validation_preprocessing(volume, label):
-    volume = tf.expand_dims(volume, axis=-1)
-    return volume, label
-
-def get_model(width=128, height=128, depth=64):
-    inputs = keras.Input((width, height, depth, 1))
-
-    x = layers.Conv3D(filters=64, kernel_size=3, activation="relu")(inputs)
-    x = layers.MaxPool3D(pool_size=2)(x)
-    x = layers.BatchNormalization()(x)
-
-    x = layers.Conv3D(filters=64, kernel_size=3, activation="relu")(x)
-    x = layers.MaxPool3D(pool_size=2)(x)
-    x = layers.BatchNormalization()(x)
-
-    x = layers.Conv3D(filters=128, kernel_size=3, activation="relu")(x)
-    x = layers.MaxPool3D(pool_size=2)(x)
-    x = layers.BatchNormalization()(x)
-
-    x = layers.Conv3D(filters=256, kernel_size=3, activation="relu")(x)
-    x = layers.MaxPool3D(pool_size=2)(x)
-    x = layers.BatchNormalization()(x)
-
-    x = layers.GlobalAveragePooling3D()(x)
-    x = layers.Dense(units=512, activation="relu")(x)
-    x = layers.Dropout(0.3)(x)
-
-    outputs = layers.Dense(units=1, activation="sigmoid")(x)
-
-    model = keras.Model(inputs, outputs, name="3dcnn")
-    return model
-
 
 def main():
     data_dir = Path("ct_preprocessed/series")
@@ -123,7 +71,7 @@ def main():
     batch_size = 2
     train_dataset = (
         train_loader.shuffle(len(x_train))
-        .map(train_preprocessing)
+        .map(DataAugmentation.augment_training, num_parallel_calls=tf.data.AUTOTUNE)
         .batch(batch_size)
         .prefetch(2)
     )
@@ -131,24 +79,16 @@ def main():
 
     validation_dataset = (
         validation_loader.shuffle(len(x_val))
-        .map(validation_preprocessing)
+        .map(DataAugmentation.prepare_validation, num_parallel_calls=tf.data.AUTOTUNE)
         .batch(batch_size)
         .prefetch(2)
     )
     print(f"Prepared validation dataset")
 
-    model = get_model(width=256, height=256, depth=256)
-
     initial_learning_rate = 0.0001
-    lr_schedule = tf.keras.optimizers.schedules.ExponentialDecay(
-        initial_learning_rate, decay_steps=100000, decay_rate=0.96, staircase=True
-    )
-    model.compile(
-        loss="binary_crossentropy",
-        optimizer= tf.keras.optimizers.Adam(learning_rate=lr_schedule),
-        metrics=["acc"],
-        run_eagerly=True,
-    )
+    model = AneurysmDetectionModel(input_shape=(256, 256, 256))
+    model.compile_model(learning_rate=initial_learning_rate)
+    model.summary()
 
     checkpoint_cb = tf.keras.callbacks.ModelCheckpoint(
         "3d_image_classification.keras", save_best_only=True
