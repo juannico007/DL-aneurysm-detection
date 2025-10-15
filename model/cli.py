@@ -2,6 +2,9 @@ from pathlib import Path
 from .data_loader import ScanDataLoader
 from .model import AneurysmDetectionModel
 from .training_pipeline import TrainingPipeline
+import torch
+from torchsummary import summary
+import pickle
 
 def main():
     """Entrypoint for preparing model and training with preprocessed images."""
@@ -12,6 +15,7 @@ def main():
     EPOCHS = 100
     LEARNING_RATE = 0.0001
     TRAIN_RATIO = 0.7
+    device = "cuda"
     
     print("\n[1/5] Loading dataset...")
     data_loader = ScanDataLoader(DATA_DIR, CSV_PATH)
@@ -19,8 +23,9 @@ def main():
     
     print("\n[2/5] Building model...")
     model = AneurysmDetectionModel(input_shape=INPUT_SHAPE)
-    model.compile_model(learning_rate=LEARNING_RATE)
-    model.summary()
+    if torch.cuda.is_available():
+        model = model.to(device)
+        print(summary(model, input_size = (1,256,256,256)))
     
     print("\n[3/5] Setting up training pipeline...")
     pipeline = TrainingPipeline(
@@ -29,8 +34,8 @@ def main():
         epochs=EPOCHS
     )
     
-    print("\n[4/5] Creating TensorFlow datasets...")
-    train_dataset, val_dataset = pipeline.create_datasets(
+    print("\n[4/5] Creating Pytorch dataloaders...")
+    train_dataset, val_dataset = pipeline.create_dataloaders(
         x_train, y_train, x_val, y_val
     )
     
@@ -39,6 +44,9 @@ def main():
     
     print("Training completed!")
     print(f"Best model saved to: {pipeline.checkpoint_path}")
+
+    with open('history.pickle', 'wb') as handle:
+        pickle.dump(history, handle, protocol=pickle.HIGHEST_PROTOCOL)
 
 
 if __name__ == "__main__":
