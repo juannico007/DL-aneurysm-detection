@@ -246,8 +246,7 @@ class TrainingPipeline:
 
             # --- ReduceLROnPlateau (manual) ---
             if len(history["val_loss"]) > self.lr_reduction_patience:
-                print(len(history["val_loss"]))
-                if history["val_loss"][-1] >= history["val_loss"][-(self.lr_reduction_patience + 1)]:
+                if lr_plateau_counter > self.lr_reduction_patience and history["val_loss"][-1] >= history["val_loss"][-(self.lr_reduction_patience + 1)]:
                     old_lr = self.optimizer.param_groups[0]['lr']
                     new_lr = max(old_lr * self.lr_reduction_factor, self.min_lr)
                     if new_lr < old_lr:

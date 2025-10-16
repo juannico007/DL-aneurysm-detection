@@ -15,6 +15,7 @@ def main():
     EPOCHS = 100
     LEARNING_RATE = 0.0001
     TRAIN_RATIO = 0.7
+    LEARNING_RATE_REDUCTION_EPOCHS = 5
     device = "cuda"
     
     print("\n[1/5] Loading dataset...")
@@ -31,7 +32,8 @@ def main():
     pipeline = TrainingPipeline(
         model=model,
         batch_size=BATCH_SIZE,
-        epochs=EPOCHS
+        epochs=EPOCHS,
+        lr_reduction_patience = LEARNING_RATE_REDUCTION_EPOCHS
     )
     
     print("\n[4/5] Creating Pytorch dataloaders...")
@@ -47,7 +49,7 @@ def main():
 
     with open('history.pickle', 'wb') as handle:
         pickle.dump(history, handle, protocol=pickle.HIGHEST_PROTOCOL)
-
+    print("history saved to history.pickle")
 
 if __name__ == "__main__":
     main()
