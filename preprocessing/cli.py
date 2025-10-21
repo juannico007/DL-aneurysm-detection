@@ -5,8 +5,8 @@ from .pipeline import Preprocess
 def main():
     """Entry point for running preprocessing with the default configuration."""
     p = Preprocess(
-        input_root=Path("ct_subset"),
-        output_root=Path("ct_preprocessed"),
+        input_root=Path("preprocessing_failing"),
+        output_root=Path("preprocessed_not_failing"),
         voxel_size=(1, 1, 1),
         shape=(256, 256, 256),
         output_format="nii.gz",

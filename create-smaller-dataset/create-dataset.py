@@ -25,7 +25,7 @@ def _copy_one_series(source, destination):
     if os.path.exists(source) and not os.path.exists(destination):
         shutil.copytree(source, destination)
 
-def copy_subset(folder_path, out_path, modality="CTA", n_series=20, workers=8, see_size=True):
+def copy_subset(folder_path, out_path, modality="CTA", n_series=20, workers=8, see_size=True, balanced = True):
     """
     Copy a subset of series folders based on the specified modality and number of series.
     """
@@ -37,8 +37,24 @@ def copy_subset(folder_path, out_path, modality="CTA", n_series=20, workers=8, s
 
     # get all series with the specified modality
     scans = df[df["Modality"] == modality]
+    print(len(scans))
 
-    subset_series = scans["SeriesInstanceUID"].unique()[:n_series]
+    if balanced: 
+        #take equal amount of positive and negative samples
+        positive_scans = scans[scans["Aneurysm Present"] == 1]
+        negative_scans = scans[scans["Aneurysm Present"] == 0]
+
+        subset_series = []
+        if len(positive_scans) < n_series // 2:
+            print("Not enough positive scans, the result will be unbalanced")
+            subset_series += list(positive_scans["SeriesInstanceUID"].unique())
+            subset_series += list(negative_scans["SeriesInstanceUID"].unique()[:n_series - len(subset_series)])
+        else:
+            print("Creating balanced subset")
+            subset_series += list(positive_scans["SeriesInstanceUID"].unique()[:n_series // 2])
+            subset_series += list(negative_scans["SeriesInstanceUID"].unique()[:n_series - len(subset_series)])
+    else:
+        subset_series = scans["SeriesInstanceUID"].unique()[:n_series]
 
     if see_size:
         # estimate folder size by getting sizes of all folders in parallel
@@ -69,9 +85,10 @@ def copy_subset(folder_path, out_path, modality="CTA", n_series=20, workers=8, s
 
 copy_subset(
     folder_path="../data/rsna-intracranial-aneurysm-detection",
-    out_path="../all_cta",
+    out_path="../ct_subset",
     modality="CTA",
-    n_series=100,
+    n_series=200,
     workers=8,
-    see_size=True
+    see_size=True,
+    balanced=True
 )

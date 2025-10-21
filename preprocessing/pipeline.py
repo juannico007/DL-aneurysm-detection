@@ -87,8 +87,10 @@ class Preprocess:
         str
             Absolute path to the written preprocessed volume file.
         """
+        
         # 1) read + resample
         image = resample_to_size(self.input_root, series_id, self.shape)
+        print("processing", series_id)
         # 2) pick policy
         policy_cls = REGISTRY.get((modality or "").upper(), ModalityPolicy)
         policy: ModalityPolicy = policy_cls()

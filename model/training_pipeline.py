@@ -113,8 +113,8 @@ class TrainingPipeline:
             train_dataset,
             batch_size=self.batch_size,
             shuffle=True,          # same as tf shuffle
-            num_workers=4,         # similar to tf AUTOTUNE parallel calls
-            pin_memory=True        # speeds up transfer to GPU
+            num_workers=0,         # similar to tf AUTOTUNE parallel calls
+            pin_memory=True,        # speeds up transfer to GPU
         )
         
         val_transforms = transforms.Compose([
@@ -126,8 +126,8 @@ class TrainingPipeline:
             val_dataset,
             batch_size=self.batch_size,
             shuffle=True,          # same as tf shuffle
-            num_workers=4,         # similar to tf AUTOTUNE parallel calls
-            pin_memory=True        # speeds up transfer to GPU
+            num_workers=0,         # similar to tf AUTOTUNE parallel calls
+            pin_memory=True,        # speeds up transfer to GPU
         )
         
         return train_loader, val_loader

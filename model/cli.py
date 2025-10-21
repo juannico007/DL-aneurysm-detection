@@ -12,10 +12,10 @@ def main():
     CSV_PATH = Path("ct_subset/train.csv")
     INPUT_SHAPE = (256, 256, 256)
     BATCH_SIZE = 2
-    EPOCHS = 100
+    EPOCHS = 50
     LEARNING_RATE = 0.0001
     TRAIN_RATIO = 0.7
-    LEARNING_RATE_REDUCTION_EPOCHS = 5
+    LEARNING_RATE_REDUCTION_EPOCHS = 4
     device = "cuda"
     
     print("\n[1/5] Loading dataset...")
@@ -33,6 +33,7 @@ def main():
         model=model,
         batch_size=BATCH_SIZE,
         epochs=EPOCHS,
+        learning_rate=LEARNING_RATE,
         lr_reduction_patience = LEARNING_RATE_REDUCTION_EPOCHS
     )
     

@@ -2,7 +2,7 @@
 import numpy as np
 import itk
 from itk import array_from_matrix
-from skimage.filters import threshold_otsu
+#from skimage.filters import threshold_otsu
 
 def ct_head_crop(
     image: itk.Image,

@@ -61,7 +61,9 @@ def resample_to_size(input_root: Path, series_id: str, volume_size: Tuple[float,
     itk.Image
         Resampled image with origin and direction preserved from the input.
     """
+    print(input_root / "series" / series_id)
     image = itk.imread(input_root / "series" / series_id, itk.F)
+    print("image loaded", input_root, series_id)
     input_size = itk.size(image)            # e.g. [x, y, z]
     input_spacing = image.GetSpacing()      # e.g. (sx, sy, sz) 
     orig_org = image.GetOrigin()

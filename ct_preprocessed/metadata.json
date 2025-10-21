@@ -1,0 +1,15 @@
+{
+    "num_series": 200,
+    "modality_counts": {
+        "CTA": 200
+    },
+    "pipeline_version": "0.0.1",
+    "voxel_size": [
+        1,
+        1,
+        1
+    ],
+    "output_format": "nii.gz",
+    "num_workers": 3,
+    "itk_threads": 6
+}

@@ -1,7 +1,7 @@
 import matplotlib.pyplot as plt
 import pickle
 
-history_path = "history.pickle"
+history_path = "../history.pickle"
 with open(history_path, 'rb') as handle:
     history = pickle.load(handle)
 
