@@ -4,6 +4,7 @@ from typing import Optional, Literal
 import multiprocessing
 import pandas as pd
 import itk
+from preprocessing.workers import load_done_ids
 from .resample import resample_to_spacing, resample_to_size
 from .registry import REGISTRY
 from .policy import ModalityPolicy
@@ -89,8 +90,10 @@ class Preprocess:
         """
         
         # 1) read + resample
-        image = resample_to_size(self.input_root, series_id, self.shape)
-        print("processing", series_id)
+        try:
+            image = resample_to_spacing(self.input_root, series_id, self.voxel_size)
+        except Exception as e:
+            raise RuntimeError(f"[{series_id} resample_to_spacing failed: {e}]") from e
         # 2) pick policy
         policy_cls = REGISTRY.get((modality or "").upper(), ModalityPolicy)
         policy: ModalityPolicy = policy_cls()
@@ -111,6 +114,7 @@ class Preprocess:
         out_dir = self.output_root / "series"
         out_dir.mkdir(parents=True, exist_ok=True)
         out_path = out_dir / f"{series_id}.{self.output_format}"
+        itk.OutputWindow.SetGlobalWarningDisplay(False)
         itk.imwrite(image, str(out_path), compression=(self.output_format == "nii.gz"))
         return str(out_path)
 
@@ -321,7 +325,17 @@ class Preprocess:
         self.preprocess_generate_metadata()
 
         df = pd.read_csv(self.input_root / "train.csv")
-        series_items = [(row["SeriesInstanceUID"], row["Modality"]) for _, row in df.iterrows()]
+        preproc_csv = self.output_root / "train.csv"
+        done_ids = load_done_ids(preproc_csv)
+        series_items = [(row["SeriesInstanceUID"], row["Modality"]) 
+                        for _, row in df.iterrows()
+                        if str(row["SeriesInstanceUID"]) not in done_ids]
+
+        if not series_items: 
+            print("✅ All series already processed.")
+        else:
+            print(f"📊 Total: {len(done_ids) + len(series_items)} | Done: {len(done_ids)} | Remaining: {len(series_items)}")
+
         run_in_process_batches(series_items, batch_size, self)
 
         sample_id = next((sid for sid, _ in series_items if isinstance(sid, str) and sid), None)
