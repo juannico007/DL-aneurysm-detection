@@ -21,26 +21,26 @@ class AneurysmDetectionModel(nn.Module):
         self.input_shape = input_shape
         self.batch_size = batch_size
 
-        self.conv1 = nn.Conv3d(1, 64, 3, padding="same")
+        self.conv1 = nn.Conv3d(1, 4, 3, padding="same")
         self.pool1 = nn.MaxPool3d(2)
-        self.bn1 = nn.BatchNorm3d(64)
+        self.bn1 = nn.BatchNorm3d(4)
 
-        self.conv2 = nn.Conv3d(64, 64, 3, padding="same")
+        self.conv2 = nn.Conv3d(4, 4, 3, padding="same")
         self.pool2 = nn.MaxPool3d(2)
-        self.bn2 = nn.BatchNorm3d(64)
+        self.bn2 = nn.BatchNorm3d(4)
 
-        self.conv3 = nn.Conv3d(64, 128, 3, padding="same")
+        self.conv3 = nn.Conv3d(4, 8, 3, padding="same")
         self.pool3 = nn.MaxPool3d(2)
-        self.bn3 = nn.BatchNorm3d(128)
+        self.bn3 = nn.BatchNorm3d(8)
 
-        self.conv4 = nn.Conv3d(128, 256, 3, padding="same")
+        self.conv4 = nn.Conv3d(8, 16, 3, padding="same")
         self.pool4 = nn.MaxPool3d(2)
-        self.bn4 = nn.BatchNorm3d(256)
+        self.bn4 = nn.BatchNorm3d(16)
 
         self.gap = nn.AdaptiveAvgPool3d(1)
-        self.fc1 = nn.Linear(256, 512)
+        self.fc1 = nn.Linear(16, 64)
         self.dropout = nn.Dropout(0.3)
-        self.fc2 = nn.Linear(512, 1)
+        self.fc2 = nn.Linear(64, 1)
     
     def forward(self, x):
         """
@@ -69,8 +69,8 @@ class AneurysmDetectionModel(nn.Module):
 
         x = F.relu(self.fc1(x))
         x = self.dropout(x)
-        
-        x = torch.sigmoid(self.fc2(x))
+        x = self.fc2(x)
+        # x = torch.sigmoid(self.fc2(x))
         
         return x
     
