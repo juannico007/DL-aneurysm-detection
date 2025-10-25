@@ -8,7 +8,7 @@ from preprocessing.workers import load_done_ids
 from .resample import resample_to_spacing, resample_to_size
 from .registry import REGISTRY
 from .policy import ModalityPolicy
-
+import numpy as np
 class Preprocess:
     """Coordinate the high-level preprocessing workflow for a dataset.
 
@@ -94,6 +94,7 @@ class Preprocess:
             image = resample_to_spacing(self.input_root, series_id, self.voxel_size)
         except Exception as e:
             raise RuntimeError(f"[{series_id} resample_to_spacing failed: {e}]") from e
+        
         # 2) pick policy
         policy_cls = REGISTRY.get((modality or "").upper(), ModalityPolicy)
         policy: ModalityPolicy = policy_cls()
@@ -115,7 +116,19 @@ class Preprocess:
         out_dir.mkdir(parents=True, exist_ok=True)
         out_path = out_dir / f"{series_id}.{self.output_format}"
         itk.OutputWindow.SetGlobalWarningDisplay(False)
-        itk.imwrite(image, str(out_path), compression=(self.output_format == "nii.gz"))
+
+        #write data as numpy and convert to float16
+        arr = itk.GetArrayFromImage(image)
+        arr = arr.astype(np.float16)
+
+        np.savez_compressed(
+            out_path,
+            vol=arr,
+            voxel_size=np.array(self.voxel_size, dtype=np.float16),
+            modality=str(modality or "unknown"),
+            pipeline_version=str(self.pipeline_version),
+        )
+        # itk.imwrite(image, str(out_path), compression=(self.output_format == "nii.gz"))
         return str(out_path)
 
     def preprocess_generate_metadata(self):
@@ -338,9 +351,9 @@ class Preprocess:
 
         run_in_process_batches(series_items, batch_size, self)
 
-        sample_id = next((sid for sid, _ in series_items if isinstance(sid, str) and sid), None)
-        if sample_id:
-            try:
-                self.preprocess_generate_overview(sample_id)
-            except Exception as exc:  # pragma: no cover - safeguards against optional dependency issues
-                print(f"Failed to create preprocessing overview figure: {exc}")
+        # sample_id = next((sid for sid, _ in series_items if isinstance(sid, str) and sid), None)
+        # if sample_id:
+        #     try:
+        #         self.preprocess_generate_overview(sample_id)
+        #     except Exception as exc:  # pragma: no cover - safeguards against optional dependency issues
+        #         print(f"Failed to create preprocessing overview figure: {exc}")

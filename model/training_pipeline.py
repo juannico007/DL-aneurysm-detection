@@ -1,3 +1,4 @@
+import queue
 from .model import AneurysmDetectionModel
 from .data_augmentation import DataAugmentation, rotate_batch_gpu
 from sklearn.metrics import accuracy_score
@@ -94,24 +95,33 @@ class CustomDataset(Dataset):
 
 
 class StreamingDataset(Dataset):
-    """
-    Simple rotating-cache dataset:
-    keeps only a small deque of preloaded volumes in RAM.
-    """
     def __init__(self, paths, labels, cache_size=8, transform=None):
         self.paths = list(paths)
         self.labels = list(labels)
-        self.cache_size = cache_size
         self.transform = transform
-
-        # Ring buffer of (idx, volume)
-        self.buffer = deque(maxlen=cache_size)
-        self.lock = threading.Lock()
+        self.cache_size = cache_size
         self.stop_event = threading.Event()
 
-        # Start the background prefetch thread
+        # Thread-safe queue
+        self.queue = queue.Queue(maxsize=cache_size)
         self.thread = threading.Thread(target=self._background_fill, daemon=True)
         self.thread.start()
+
+    def __len__(self):
+        return len(self.paths)
+
+    def _background_fill(self):
+        i = 0
+        while not self.stop_event.is_set():
+            try:
+                idx = i % len(self.paths)
+                vol = self._load_one(idx)
+                # blocks if queue is full (waits for model to consume)
+                self.queue.put((idx, vol))
+                i += 1
+            except Exception as e:
+                print(f"Prefetch error: {e}")
+                time.sleep(0.05)
 
     def _load_one(self, idx):
         path = self.paths[idx]
@@ -124,41 +134,21 @@ class StreamingDataset(Dataset):
             vol = torch.zeros((1, 32, 32, 32), dtype=torch.float16)
         return vol
 
-    def _background_fill(self):
-        """
-        Background thread: keep the deque full.
-        """
-        i = 0
-        while not self.stop_event.is_set():
-            with self.lock:
-                if len(self.buffer) < self.cache_size:
-                    idx = i % len(self.paths)
-                    vol = self._load_one(idx)
-                    self.buffer.append((idx, vol))
-                    i += 1
-                else:
-                    pass  # buffer full
-            time.sleep(0.01)  # small sleep to yield
-
-    def __len__(self):
-        return len(self.paths)
-
     def __getitem__(self, idx):
-        # Check if volume is in cache
-        with self.lock:
-            for i, (cached_idx, vol) in enumerate(self.buffer):
-                if cached_idx == idx:
-                    label = self.labels[idx]
-                    if self.transform:
-                        vol = self.transform(vol)
-                    return vol, label
-
-        # Fallback: load synchronously if not yet cached
-        vol = self._load_one(idx)
-        label = self.labels[idx]
-        if self.transform:
-            vol = self.transform(vol)
-        return vol, label
+        # try to get item from queue if available
+        try:
+            cached_idx, vol = self.queue.get(timeout=2.0)  # waits until data ready
+            label = self.labels[cached_idx]
+            if self.transform:
+                vol = self.transform(vol)
+            return vol, label
+        except queue.Empty:
+            # fallback: load directly
+            vol = self._load_one(idx)
+            label = self.labels[idx]
+            if self.transform:
+                vol = self.transform(vol)
+            return vol, label
 
     def shutdown(self):
         self.stop_event.set()
