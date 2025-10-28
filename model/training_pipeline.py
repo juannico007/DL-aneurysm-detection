@@ -14,6 +14,7 @@ from typing import List, Tuple
 import torch.nn.functional as F
 import bitsandbytes as bnb
 from accelerate import Accelerator
+from accelerate.utils import pad_across_processes
 
 # for faster dataSet
 import threading, time
@@ -255,6 +256,24 @@ class TrainingPipeline:
         self.train_loader, self.val_loader = self.accelerator.prepare(train_loader, val_loader)
         return self.train_loader, self.val_loader
     
+    def _safe_gather(self, tensor):
+        """Safely gather tensors across processes for Gloo backend."""
+        tensor = tensor.flatten().contiguous()
+        
+        # Get max size across processes
+        local_size = torch.tensor(tensor.shape[0], device=self.device)
+        all_sizes = self.accelerator.gather(local_size)
+        max_size = all_sizes.max().item()
+        
+        # Pad to max size
+        current_size = tensor.shape[0]
+        if current_size == max_size:
+            return self.accelerator.gather(tensor)
+        
+        tensor = torch.nn.functional.pad(tensor, (0, max_size - current_size), value=0)
+
+        return self.accelerator.gather(tensor)
+    
     def train(
         self,
         train_loader: TensorDataset,
@@ -332,8 +351,8 @@ class TrainingPipeline:
             all_labels = torch.cat(all_labels, dim=0).to(self.device, dtype=torch.float32).contiguous()
 
             # Now safe to gather on GPU
-            all_preds  = self.accelerator.gather_for_metrics(all_preds)
-            all_labels = self.accelerator.gather_for_metrics(all_labels)
+            all_preds  = self._safe_gather(all_preds)
+            all_labels = self._safe_gather(all_labels)
 
             # Post-process on CPU
             probs = torch.sigmoid(all_preds)
@@ -357,8 +376,9 @@ class TrainingPipeline:
                         loss = self.criterion(outputs, y_batch)
                     val_losses.append(self.accelerator.gather(loss.detach()).mean().item())
 
-                    preds  = self.accelerator.gather_for_metrics(outputs.detach().to(torch.float32))
-                    labels = self.accelerator.gather_for_metrics(y_batch.detach().to(torch.float32))
+                    # Gather across processes
+                    preds = self._safe_gather(outputs.detach().to(torch.float32))
+                    labels = self._safe_gather(y_batch.detach().to(torch.float32))
 
                     # Sigmoid + threshold (done in float32 for numerical stability)
                     probs = torch.sigmoid(preds)

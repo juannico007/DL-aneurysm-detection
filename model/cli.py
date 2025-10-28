@@ -3,6 +3,7 @@ from .data_loader import ScanDataLoader
 from .model import AneurysmDetectionModel
 from .training_pipeline import TrainingPipeline
 import torch
+import torch.distributed as dist
 from torchsummary import summary
 import pickle
 
@@ -23,6 +24,9 @@ def main():
     CACHE_SIZE = 8
     
     device = "cuda"
+
+    if not dist.is_initialized():
+        dist.init_process_group(backend="gloo")
     
     print("\n[1/5] Loading dataset...")
     data_loader = ScanDataLoader(DATA_DIR, CSV_PATH)
