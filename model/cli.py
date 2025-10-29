@@ -6,16 +6,22 @@ import torch
 from torchsummary import summary
 import pickle
 
+import os
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+
 def main():
     """Entrypoint for preparing model and training with preprocessed images."""
     DATA_DIR = Path("ct_preprocessed/series")
     CSV_PATH = Path("ct_subset/train.csv")
     INPUT_SHAPE = (256, 256, 256)
     BATCH_SIZE = 2
-    EPOCHS = 50
+    GRADIENT_ACCUMULATION = 4 # simmulate: batch_size = batch_size * gradient_accumulation
+    EPOCHS = 5
     LEARNING_RATE = 0.0001
     TRAIN_RATIO = 0.7
     LEARNING_RATE_REDUCTION_EPOCHS = 4
+    CACHE_SIZE = 8
+    
     device = "cuda"
     
     print("\n[1/5] Loading dataset...")
@@ -34,7 +40,9 @@ def main():
         batch_size=BATCH_SIZE,
         epochs=EPOCHS,
         learning_rate=LEARNING_RATE,
-        lr_reduction_patience = LEARNING_RATE_REDUCTION_EPOCHS
+        lr_reduction_patience = LEARNING_RATE_REDUCTION_EPOCHS,
+        cache_size=CACHE_SIZE,
+        grad_accum_steps=GRADIENT_ACCUMULATION
     )
     
     print("\n[4/5] Creating Pytorch dataloaders...")
