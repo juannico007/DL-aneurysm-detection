@@ -13,10 +13,10 @@
   },
 
   "bf16": {
-    "enabled": true
+    "enabled": false
   },
   "fp16": {
-    "enabled": false
+    "enabled": true
   },
   
   "gradient_clipping": 1.0,
