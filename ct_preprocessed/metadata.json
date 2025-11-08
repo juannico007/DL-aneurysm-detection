@@ -9,7 +9,7 @@
         1,
         1
     ],
-    "output_format": "nii.gz",
+    "output_format": "npz",
     "num_workers": 3,
     "itk_threads": 6
 }

@@ -1,7 +1,7 @@
 import queue
 from .model import AneurysmDetectionModel
 from .data_augmentation import DataAugmentation, rotate_batch_gpu
-from sklearn.metrics import accuracy_score
+from sklearn.metrics import accuracy_score, f1_score
 from typing import Tuple
 from torch.utils.data import TensorDataset, Dataset, DataLoader
 import torch.optim as optim
@@ -161,6 +161,7 @@ class TrainingPipeline:
     def __init__(
         self,
         model: AneurysmDetectionModel,
+        pos_weight: int,
         batch_size: int = 4,
         epochs: int = 4,
         learning_rate : float = 1e-4,
@@ -189,6 +190,7 @@ class TrainingPipeline:
             checkpoint_path: Path to save best model
         """
         self.model = model
+        self.pos_weight = pos_weight
         self.batch_size = batch_size
         self.epochs = epochs
         self.learning_rate = learning_rate
@@ -305,8 +307,9 @@ class TrainingPipeline:
             betas = (0.9, 0.999),
             eps=1e-8,
             weight_decay=0.01)
-        self.criterion = nn.BCEWithLogitsLoss()
-        self.scheduler = optim.lr_scheduler.StepLR(self.optimizer, step_size=100, gamma=0.96) #Exponential decay scheduler
+        self.criterion = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([self.pos_weight]).to(self.device, dtype=torch.bfloat16)) # for class imbalance parameter
+        # self.scheduler = optim.lr_scheduler.StepLR(self.optimizer, step_size=100, gamma=0.96) #Exponential decay scheduler
+        self.scheduler = optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=10)
 
         self.model, self.optimizer = self.accelerator.prepare(self.model, self.optimizer)
         #Since we have to define our own training loop, we have to keep track
@@ -317,8 +320,8 @@ class TrainingPipeline:
 
         #Also we want to keep track of our training history
         history = {
-            "train_loss": [], "train_acc": [],
-            "val_loss": [], "val_acc": []
+            "train_loss": [], "train_acc": [], "train_f1": [],
+            "val_loss": [], "val_acc": [], "val_f1": []
         }
 
         for epoch in range(1, self.epochs + 1):
@@ -360,9 +363,11 @@ class TrainingPipeline:
             labs  = all_labels.int().cpu().numpy()
 
             train_acc = accuracy_score(labs, preds)
+            train_f1 = f1_score(labs, preds, average="binary")
 
             history["train_loss"].append(np.mean(train_losses))
             history["train_acc"].append(train_acc)
+            history["train_f1"].append(train_f1)
 
             # --- Validation ---
             self.model.eval()
@@ -387,19 +392,24 @@ class TrainingPipeline:
 
                     # Compute batch accuracy
                     batch_acc = accuracy_score(labs_np, preds_np)
+                    batch_f1 = f1_score(labs_np, preds_np, average="binary")
                     val_accs.append(batch_acc)
+                    # val_f1s.append(batch_f1)
 
                     # Free temporary tensors
                     del preds, labels, probs, preds_np, labs_np, outputs, loss
                     torch.cuda.empty_cache()
 
             val_acc = np.mean(val_accs)
+            # val_f1 = np.mean(val_f1s)
+            
             history["val_loss"].append(np.mean(val_losses))
-            history["val_acc"].append( val_acc)
+            history["val_acc"].append(val_acc)
+            # history["val_f1"].append(val_f1)
 
             self.accelerator.print(
                 f"Epoch {epoch}/{self.epochs} | "
-                f"Train Loss: {history['train_loss'][-1]:.4f} | Acc: {train_acc:.4f} | "
+                f"Train Loss: {history['train_loss'][-1]:.4f} | Acc: {train_acc:.4f} | F1: {train_f1:.4f} |"
                 f"Val Loss: {history['val_loss'][-1]:.4f} | Acc: {val_acc:.4f}"
             )
 

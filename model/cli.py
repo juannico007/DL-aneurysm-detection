@@ -6,6 +6,7 @@ import torch
 import torch.distributed as dist
 from torchsummary import summary
 import pickle
+import numpy as np
 
 import os
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
@@ -15,12 +16,12 @@ def main():
     DATA_DIR = Path("ct_preprocessed/series")
     CSV_PATH = Path("ct_subset/train.csv")
     INPUT_SHAPE = (256, 256, 256)
-    BATCH_SIZE = 2
-    GRADIENT_ACCUMULATION = 4 # simmulate: batch_size = batch_size * gradient_accumulation
-    EPOCHS = 5
-    LEARNING_RATE = 0.0001
+    BATCH_SIZE = 4
+    GRADIENT_ACCUMULATION = 6 # simmulate: batch_size = batch_size * gradient_accumulation
+    EPOCHS = 50
+    LEARNING_RATE = 0.0001      
     TRAIN_RATIO = 0.7
-    LEARNING_RATE_REDUCTION_EPOCHS = 4
+    LEARNING_RATE_REDUCTION_EPOCHS = 6
     CACHE_SIZE = 8
     
     device = "cuda"
@@ -41,6 +42,7 @@ def main():
     print("\n[3/5] Setting up training pipeline...")
     pipeline = TrainingPipeline(
         model=model,
+        pos_weight = (len(y_train) - np.sum(y_train)) / np.sum(y_train),
         batch_size=BATCH_SIZE,
         epochs=EPOCHS,
         learning_rate=LEARNING_RATE,
