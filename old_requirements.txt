@@ -1,0 +1,25 @@
+# Core scientific stack
+numpy>=1.24
+pandas>=1.5
+scipy>=1.11
+scikit-learn>=1.2
+
+# PyTorch for 3D CNNs
+torch>=2.1
+torchvision>=0.16
+torchaudio>=2.1
+# NOTE: CUDA version must match your GPU and system; check PyTorch install guide
+
+# Medical imaging IO and resampling
+itk>=5.3
+
+# Visualisation and progress helpers
+matplotlib>=3.6
+tqdm>=4.64
+
+# Model inspection / summary
+torchsummary>=1.5.1
+torchinfo>=1.8
+
+# Optional: Jupyter for experimentation
+jupyterlab>=4.0

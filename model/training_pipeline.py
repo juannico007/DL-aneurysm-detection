@@ -1,7 +1,7 @@
 import queue
 from .model import AneurysmDetectionModel
 from .data_augmentation import DataAugmentation, rotate_batch_gpu
-from sklearn.metrics import accuracy_score, f1_score
+from sklearn.metrics import accuracy_score, f1_score, fbeta_score
 from typing import Tuple
 from torch.utils.data import TensorDataset, Dataset, DataLoader
 import torch.optim as optim
@@ -13,8 +13,9 @@ import numpy as np
 from typing import List, Tuple
 import torch.nn.functional as F
 import bitsandbytes as bnb
+from pathlib import Path
 from accelerate import Accelerator
-from accelerate.utils import pad_across_processes
+from accelerate.utils import LoggerType, ProjectConfiguration
 
 # for faster dataSet
 import threading, time
@@ -53,7 +54,7 @@ def pad_collate_3d(batch: List[Tuple[torch.Tensor, torch.Tensor]], multiple: int
         # x is (1,D,H,W)
         _, D, H, W = x.shape
         pd, ph, pw = Dt - D, Ht - H, Wt - W
-        x = x.to(torch.bfloat16)
+        x = x.to(torch.float16)
         # pad order: (W_left, W_right, H_left, H_right, D_left, D_right)
         x_pad = F.pad(x, (0, pw, 0, ph, 0, pd), value=0.0)
         padded.append(x_pad)
@@ -85,7 +86,7 @@ class CustomDataset(Dataset):
 
         # Convert numpy to tensor if needed
         if isinstance(x, np.ndarray):
-            x = torch.from_numpy(x).to(torch.bfloat16)
+            x = torch.from_numpy(x).to(torch.float16)
 
         # Apply transforms / augmentation
         if self.transform:
@@ -170,9 +171,10 @@ class TrainingPipeline:
         lr_reduction_factor : float = 0.5,
         min_lr : float = 1e-7,
         checkpoint_path: str = "aneurysm_detection_best.pt",
-        mixed_precision: str = "bf16",
+        mixed_precision: str = "fp16",
         grad_accum_steps: int = 2,
-        cache_size : int = 8
+        cache_size : int = 8,
+        tensorboard_project_dir: str = "runs/tensorboard"
     ):
         """
         Initialize training pipeline.
@@ -200,8 +202,32 @@ class TrainingPipeline:
         self.min_lr = min_lr
         self.checkpoint_path = checkpoint_path
 
-        self.accelerator = Accelerator(mixed_precision = mixed_precision, 
-                                       gradient_accumulation_steps = grad_accum_steps)
+        self.tensorboard_project_dir = Path(tensorboard_project_dir)
+        self.tensorboard_project_dir.mkdir(parents=True, exist_ok=True)
+
+        project_config = ProjectConfiguration(
+            project_dir=str(self.tensorboard_project_dir),
+            logging_dir=str(self.tensorboard_project_dir)
+        )
+
+        self.accelerator = Accelerator(
+            mixed_precision = mixed_precision, 
+            gradient_accumulation_steps = grad_accum_steps,
+            log_with=[LoggerType.TENSORBOARD],
+            project_config=project_config
+        )
+        
+        hps = {
+            "batch_size": batch_size,
+            "epochs": epochs,
+            "learning_rate": learning_rate,
+            "early_stopping_patience": early_stopping_patience,
+            "lr_reduction_patience": lr_reduction_patience,
+            "lr_reduction_factor": lr_reduction_factor,
+            "min_lr": min_lr,
+            "grad_accum_steps": grad_accum_steps
+        }
+        self.accelerator.init_trackers("training_pipeline", config=hps)
         self.cache_size = cache_size
     
     def create_dataloaders(
@@ -320,8 +346,8 @@ class TrainingPipeline:
 
         #Also we want to keep track of our training history
         history = {
-            "train_loss": [], "train_acc": [], "train_f1": [],
-            "val_loss": [], "val_acc": [], "val_f1": []
+            "train_loss": [], "train_acc": [], "train_f1": [], "train_f2": [],
+            "val_loss": [], "val_acc": [], "val_f1": [], "val_f2": []
         }
 
         for epoch in range(1, self.epochs + 1):
@@ -332,8 +358,8 @@ class TrainingPipeline:
                 # y to float column vector
                 y_batch = y_batch.float().unsqueeze(1)
 
-                x_batch = x_batch.to(self.device, dtype=torch.bfloat16, non_blocking=True)
-                y_batch = y_batch.to(self.device, dtype=torch.bfloat16, non_blocking=True)
+                x_batch = x_batch.to(self.device, dtype=torch.float16, non_blocking=True)
+                y_batch = y_batch.to(self.device, dtype=torch.float16, non_blocking=True)
 
                 with self.accelerator.accumulate(self.model):
                     with self.accelerator.autocast():
@@ -359,20 +385,22 @@ class TrainingPipeline:
 
             # Post-process on CPU
             probs = torch.sigmoid(all_preds)
-            preds = (probs >= 0.5).int().cpu().numpy()
-            labs  = all_labels.int().cpu().numpy()
+            train_preds_np = (probs >= 0.5).int().cpu().numpy().ravel()
+            train_labels_np  = all_labels.int().cpu().numpy().ravel()
 
-            train_acc = accuracy_score(labs, preds)
-            train_f1 = f1_score(labs, preds, average="binary")
+            train_acc = accuracy_score(train_labels_np, train_preds_np)
+            train_f1 = f1_score(train_labels_np, train_preds_np, zero_division=0)
+            train_f2 = fbeta_score(train_labels_np, train_preds_np, beta=2, zero_division=0)
 
             history["train_loss"].append(np.mean(train_losses))
             history["train_acc"].append(train_acc)
             history["train_f1"].append(train_f1)
+            history["train_f2"].append(train_f2)
 
             # --- Validation ---
             self.model.eval()
-            val_losses, val_preds, val_labels = [], [], []
-            val_accs = []
+            val_losses = []
+            val_preds_list, val_labels_list = [], []
             with torch.no_grad():
                 for x_batch, y_batch in self.val_loader:
                     y_batch = y_batch.float().unsqueeze(1)
@@ -390,28 +418,45 @@ class TrainingPipeline:
                     preds_np = (probs >= 0.5).int().cpu().numpy()
                     labs_np  = labels.int().cpu().numpy()
 
-                    # Compute batch accuracy
-                    batch_acc = accuracy_score(labs_np, preds_np)
-                    batch_f1 = f1_score(labs_np, preds_np, average="binary")
-                    val_accs.append(batch_acc)
-                    # val_f1s.append(batch_f1)
+                    val_preds_list.append(preds_np)
+                    val_labels_list.append(labs_np)
 
                     # Free temporary tensors
                     del preds, labels, probs, preds_np, labs_np, outputs, loss
                     torch.cuda.empty_cache()
 
-            val_acc = np.mean(val_accs)
-            # val_f1 = np.mean(val_f1s)
-            
+            val_preds_np = np.concatenate(val_preds_list, axis=0).ravel()
+            val_labels_np = np.concatenate(val_labels_list, axis=0).ravel()
+
+            val_acc = accuracy_score(val_labels_np, val_preds_np)
+            val_f1 = f1_score(val_labels_np, val_preds_np, zero_division=0)
+            val_f2 = fbeta_score(val_labels_np, val_preds_np, beta=2, zero_division=0)
             history["val_loss"].append(np.mean(val_losses))
             history["val_acc"].append(val_acc)
-            # history["val_f1"].append(val_f1)
+            history["val_f1"].append(val_f1)
+            history["val_f2"].append(val_f2)
 
             self.accelerator.print(
                 f"Epoch {epoch}/{self.epochs} | "
-                f"Train Loss: {history['train_loss'][-1]:.4f} | Acc: {train_acc:.4f} | F1: {train_f1:.4f} |"
-                f"Val Loss: {history['val_loss'][-1]:.4f} | Acc: {val_acc:.4f}"
+                f"Train Loss: {history['train_loss'][-1]:.4f} | Acc: {train_acc:.4f} | "
+                f"F1: {train_f1:.4f} | F2: {train_f2:.4f} | "
+                f"Val Loss: {history['val_loss'][-1]:.4f} | Acc: {val_acc:.4f} | "
+                f"F1: {val_f1:.4f} | F2: {val_f2:.4f}"
             )
+
+            epoch_metrics = {
+                "train/loss": history["train_loss"][-1],
+                "train/acc": train_acc,
+                "train/f1": train_f1,
+                "train/f2": train_f2,
+                "val/loss": history["val_loss"][-1],
+                "val/acc": val_acc,
+                "val/f1": val_f1,
+                "val/f2": val_f2,
+                "lr": self.optimizer.param_groups[0]["lr"],
+                "epoch": epoch,
+            }
+            self.accelerator.log(epoch_metrics, step=epoch)
 
             # --- Checkpointing ---
             if val_acc > best_val_acc:
@@ -446,4 +491,5 @@ class TrainingPipeline:
 
             self.scheduler.step()
 
+        self.accelerator.end_training()
         return history
