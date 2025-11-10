@@ -1,0 +1,11 @@
+{
+  "title": "Mini RSNA Intracranial Aneurysm Detection Dataset",
+  "id": "juannicolasquintero/rsna-intracranial-aneurysm-detection-cta",
+  "licenses": [
+    {
+      "name": "CC0-1.0"
+    }
+  ],
+  "description": "A subset of 200 CTA series from the RSNA Intracranial Aneurysm Detection dataset.",
+  "private": true
+}

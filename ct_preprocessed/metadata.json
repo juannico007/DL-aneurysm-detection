@@ -1,7 +1,7 @@
 {
-    "num_series": 200,
+    "num_series": 1808,
     "modality_counts": {
-        "CTA": 200
+        "CTA": 1808
     },
     "pipeline_version": "0.0.1",
     "voxel_size": [
@@ -9,7 +9,7 @@
         1,
         1
     ],
-    "output_format": "nii.gz",
+    "output_format": "npz",
     "num_workers": 3,
     "itk_threads": 6
 }
