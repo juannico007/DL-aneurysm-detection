@@ -19,7 +19,7 @@ def main():
     BATCH_SIZE = 4
     GRADIENT_ACCUMULATION = 6 # simmulate: batch_size = batch_size * gradient_accumulation
     EPOCHS = 50
-    LEARNING_RATE = 0.0001      
+    LEARNING_RATE = 0.0002     
     TRAIN_RATIO = 0.7
     LEARNING_RATE_REDUCTION_EPOCHS = 6
     CACHE_SIZE = 8
