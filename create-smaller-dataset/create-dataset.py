@@ -4,6 +4,7 @@ import shutil
 import pandas as pd
 from pathlib import Path
 from tqdm import tqdm
+from subprocess import call
 
 def get_folder_size(path):
     """
@@ -20,10 +21,19 @@ def get_folder_size(path):
 
 def _copy_one_series(source, destination):
     """
-    Copy a single series folder from source to destination if source exists and destination does not exist.
+    Efficiently copy a folder using robocopy on Windows or rsync on Linux/macOS.
     """
-    if os.path.exists(source) and not os.path.exists(destination):
-        shutil.copytree(source, destination)
+    if not os.path.exists(source) or os.path.exists(destination):
+        return
+
+    if os.name == "nt":
+        # /E copies subdirectories including empty ones
+        # /COPYALL preserves timestamps, ownership, permissions, etc.
+        # /MT:8 uses 8 threads (adjust as needed)
+        call(f'robocopy "{source}" "{destination}" /E /COPY:DAT /MT:8 /R:1 /W:1 /NFL /NDL /NJH /NJS /NP /NS /NC', shell=True)
+    else:
+        # fallback for non-Windows systems
+        call(["rsync", "-a", "--info=progress2", source + "/", destination])
 
 def copy_subset(folder_path, out_path, modality="CTA", n_series=20, workers=8, see_size=True, balanced = True):
     """
@@ -37,7 +47,10 @@ def copy_subset(folder_path, out_path, modality="CTA", n_series=20, workers=8, s
 
     # get all series with the specified modality
     scans = df[df["Modality"] == modality]
-    print(len(scans))
+    print("Taking",len(scans), "scans to make the subset")
+
+    if n_series == -1:
+        n_series = len(scans)
 
     if balanced: 
         #take equal amount of positive and negative samples
@@ -45,10 +58,15 @@ def copy_subset(folder_path, out_path, modality="CTA", n_series=20, workers=8, s
         negative_scans = scans[scans["Aneurysm Present"] == 0]
 
         subset_series = []
-        if len(positive_scans) < n_series // 2:
+        print("There are", len(positive_scans), "positive scans and", len(negative_scans), "negative scans")
+        if min(len(positive_scans), len(negative_scans)) < n_series // 2:
             print("Not enough positive scans, the result will be unbalanced")
-            subset_series += list(positive_scans["SeriesInstanceUID"].unique())
-            subset_series += list(negative_scans["SeriesInstanceUID"].unique()[:n_series - len(subset_series)])
+            if len(positive_scans) < len(negative_scans):
+                add_series = [positive_scans, negative_scans]
+            else:
+                add_series = [negative_scans, positive_scans]
+            subset_series += list(add_series[0]["SeriesInstanceUID"].unique())
+            subset_series += list(add_series[1]["SeriesInstanceUID"].unique()[:n_series - len(subset_series)])
         else:
             print("Creating balanced subset")
             subset_series += list(positive_scans["SeriesInstanceUID"].unique()[:n_series // 2])
@@ -87,7 +105,7 @@ copy_subset(
     folder_path="../data/rsna-intracranial-aneurysm-detection",
     out_path="../ct_subset",
     modality="CTA",
-    n_series=200,
+    n_series=-1,
     workers=8,
     see_size=True,
     balanced=True
