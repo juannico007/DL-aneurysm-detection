@@ -7,7 +7,7 @@ from typing import Tuple
 class ScanDataLoader:
     """Custom data loader for volumes."""
     
-    def __init__(self, data_dir: Path, csv_path: Path, cache_dir: Path = Path("cache")):
+    def __init__(self, data_dir: Path, csv_path: Path, proportion_to_use: float = 1, cache_dir: Path = Path("cache")):
         """
         Initialize the data loader.
         
@@ -21,6 +21,7 @@ class ScanDataLoader:
         self.csv_path = Path(csv_path)
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(exist_ok=True)
+        self.proportion_to_use = proportion_to_use
         
         self.image_paths = []
         self.labels = []
@@ -29,6 +30,8 @@ class ScanDataLoader:
     def _load_dataset(self):
         """Load dataset paths and labels from CSV."""
         df = pd.read_csv(self.csv_path)
+        if self.proportion_to_use < 1:
+            df = df.sample(frac=self.proportion_to_use)
         
         for uid, label in zip(df["SeriesInstanceUID"], df["Aneurysm Present"].values):
             path = self.data_dir / f"{uid}.npz"
@@ -119,6 +122,9 @@ class ScanDataLoader:
 
     def split_data(self, train_ratio: float = 0.7):
         df = pd.read_csv(self.csv_path)
+        if self.proportion_to_use < 1:
+            df = df.sample(frac=self.proportion_to_use)
+        
         paths, labels = [], []
         for uid, label in zip(df["SeriesInstanceUID"], df["Aneurysm Present"]):
             path = self.data_dir / f"{uid}.npz"

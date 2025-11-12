@@ -6,6 +6,7 @@ from typing import Tuple
 from torch.utils.data import TensorDataset, Dataset, DataLoader
 import torch.optim as optim
 import torch.nn as nn
+import torch.nn.utils as utils
 import torch
 from tqdm import tqdm
 from torchvision import transforms
@@ -16,6 +17,7 @@ import bitsandbytes as bnb
 from pathlib import Path
 from accelerate import Accelerator
 from accelerate.utils import LoggerType, ProjectConfiguration
+import pandas as pd
 
 # for faster dataSet
 import threading, time
@@ -37,30 +39,39 @@ def pad_collate_3d(batch: List[Tuple[torch.Tensor, torch.Tensor]], multiple: int
     We pad on the right to (Dt,Ht,Wt) = per-batch max (rounded to 'multiple'),
     then stack into (B, 1, Dt, Ht, Wt).
     """
-    xs, ys = zip(*batch)  # xs: tuple of tensors (1,D,H,W), ys: tuple of ints/tensors
+    xs, ms, ys = zip(*batch)  # xs: tuple of tensors (1,D,H,W), ys: tuple of ints/tensors
 
     # ensure labels tensor (B,)
     Y = torch.as_tensor(ys, dtype=torch.long)
 
     # get per-batch target size
     shapes = [x.shape[-3:] for x in xs]  # (D,H,W)
-    Dm = max(s[0] for s in shapes)
-    Hm = max(s[1] for s in shapes)
-    Wm = max(s[2] for s in shapes)
+    Dm, Hm, Wm = (max(s[i] for s in shapes) for i in range(3))
     Dt, Ht, Wt = _round_up(Dm, multiple), _round_up(Hm, multiple), _round_up(Wm, multiple)
 
-    padded = []
-    for x in xs:
+    padded_x, padded_m = [], []
+    for x, m in zip(xs, ms):
         # x is (1,D,H,W)
         _, D, H, W = x.shape
         pd, ph, pw = Dt - D, Ht - H, Wt - W
-        x = x.to(torch.float16)
         # pad order: (W_left, W_right, H_left, H_right, D_left, D_right)
-        x_pad = F.pad(x, (0, pw, 0, ph, 0, pd), value=0.0)
-        padded.append(x_pad)
+        x = F.pad(x, (0,pw,0,ph,0,pd), value=0.0)
+        m = F.pad(m, (0,pw,0,ph,0,pd), value=0)
+        padded_x.append(x)
+        padded_m.append(m)
 
-    X = torch.stack(padded, dim=0)  # (B,1,Dt,Ht,Wt)
-    return X, Y
+    X = torch.stack(padded_x, dim=0)
+    M = torch.stack(padded_m, dim=0)
+    return X, M, Y
+
+def make_sphere_mask(shape, center, radius=5.0):
+    """Return a binary 3D mask with a filled sphere."""
+    z, y, x = np.ogrid[:shape[0], :shape[1], :shape[2]]
+    cz, cy, cx = center
+    dist = (x - cx)**2 + (y - cy)**2 + (z - cz)**2
+    mask = dist <= radius**2
+    return mask.astype(np.uint8)
+
 class CustomDataset(Dataset):
     """Custom dataset to perform dataloading in pytorch"""
     def __init__(self, x_data, y_data, transform=None):
@@ -97,12 +108,22 @@ class CustomDataset(Dataset):
 
 
 class StreamingDataset(Dataset):
-    def __init__(self, paths, labels, cache_size=8, transform=None):
+    def __init__(self, paths, labels, cache_size=8, transform=None,
+                 localizer_csv: Path = None, radius: float = 5.0):
         self.paths = list(paths)
         self.labels = list(labels)
         self.transform = transform
         self.cache_size = cache_size
         self.stop_event = threading.Event()
+        self.radius = radius
+
+        if localizer_csv is not None:
+            df = pd.read_csv(localizer_csv)
+            self.localizer_df = df.set_index("SeriesInstanceUID")
+        else:
+            self.localizer_df = None
+
+        
 
         # Thread-safe queue
         self.queue = queue.Queue(maxsize=cache_size)
@@ -127,30 +148,45 @@ class StreamingDataset(Dataset):
 
     def _load_one(self, idx):
         path = self.paths[idx]
+        uid = Path(path).stem
         try:
             data = np.load(path, mmap_mode='r')
             vol = data['vol'].astype(np.float16)
             vol = torch.from_numpy(vol).unsqueeze(0)  # (1,D,H,W)
+            if self.localizer_df is not None:
+                subset = self.localizer_df[self.localizer_df["SeriesInstanceUID"] == uid]
+                if not subset.empty:
+                    mask_np = np.zeros(vol.shape[1:], dtype=np.uint8)
+                    for _, row in subset.iterrows():
+                        coords = np.array([row["z"], row["y"], row["x"]], dtype=float)  # note: ensure same axis order as volume
+                        sphere = make_sphere_mask(vol.shape[1:], coords, radius=self.radius)
+                        mask_np |= sphere  # combine spheres
+                else:
+                    mask_np = np.zeros(vol.shape[1:], dtype=np.uint8)
+            else:
+                mask_np = np.zeros(vol.shape[1:], dtype=np.uint8)
+            mask = torch.from_numpy(mask_np).unsqueeze(0)  # (1,D,H,W)
         except Exception as e:
             print(f"[Warning] Failed to load {path}: {e}")
             vol = torch.zeros((1, 32, 32, 32), dtype=torch.float16)
-        return vol
+            mask = torch.zeros_like(vol, dtype=torch.uint8)
+        return vol, mask
 
     def __getitem__(self, idx):
         # try to get item from queue if available
         try:
-            cached_idx, vol = self.queue.get(timeout=2.0)  # waits until data ready
+            cached_idx, vol, mask = self.queue.get(timeout=2.0)  # waits until data ready
             label = self.labels[cached_idx]
             if self.transform:
                 vol = self.transform(vol)
-            return vol, label
+            return vol, mask, label
         except queue.Empty:
             # fallback: load directly
             vol = self._load_one(idx)
             label = self.labels[idx]
             if self.transform:
                 vol = self.transform(vol)
-            return vol, label
+            return vol, mask, label
 
     def shutdown(self):
         self.stop_event.set()
@@ -173,7 +209,8 @@ class TrainingPipeline:
         mixed_precision: str = "fp16",
         grad_accum_steps: int = 2,
         cache_size : int = 8,
-        tensorboard_project_dir: str = "runs/tensorboard"
+        tensorboard_project_dir: str = "runs/tensorboard",
+        radius: int = 10
     ):
         """
         Initialize training pipeline.
@@ -199,6 +236,7 @@ class TrainingPipeline:
         self.lr_reduction_factor = lr_reduction_factor
         self.min_lr = min_lr
         self.checkpoint_path = checkpoint_path
+        self.radius = radius
 
         self.tensorboard_project_dir = Path(tensorboard_project_dir)
         self.tensorboard_project_dir.mkdir(parents=True, exist_ok=True)
@@ -255,7 +293,7 @@ class TrainingPipeline:
         # train_dataset = CustomDataset(x_train, y_train, transform=train_transforms)
 
         train_dataset = StreamingDataset(x_train, y_train, cache_size=self.cache_size,
-                                 transform=train_transforms)
+                                 transform=train_transforms, radius=self.radius)
         train_loader = DataLoader(
             train_dataset,
             batch_size=self.batch_size,
@@ -270,7 +308,7 @@ class TrainingPipeline:
         ])
         #val_dataset = CustomDataset(x_val, y_val, transform=val_transforms)
         val_dataset = StreamingDataset(x_val,   y_val,   cache_size=self.cache_size,
-                                 transform=val_transforms)
+                                 transform=val_transforms, radius = self.radius)
         val_loader = DataLoader(
             val_dataset,
             batch_size=self.batch_size,
@@ -351,21 +389,24 @@ class TrainingPipeline:
             self.model.train()
             train_losses, all_preds, all_labels = [], [], []
 
-            for x_batch, y_batch in tqdm(self.train_loader):
+            for x_batch, mask_batch, y_batch in tqdm(self.train_loader):
                 # y to float column vector
                 y_batch = y_batch.float().unsqueeze(1)
 
                 x_batch = x_batch.to(self.device, dtype=torch.float16, non_blocking=True)
+                mask_batch = mask_batch.to(self.device, dtype=torch.float16)
                 y_batch = y_batch.to(self.device, dtype=torch.float16, non_blocking=True)
 
+                x_batch, angles = rotate_batch_gpu(x_batch, mode='bilinear')
+                mask_batch, _ = rotate_batch_gpu(mask_batch, angles=angles, mode='nearest')
                 with self.accelerator.accumulate(self.model):
                     with self.accelerator.autocast():
-                        x_batch = rotate_batch_gpu(x_batch)
                         outputs = self.model(x_batch)
                         loss = self.criterion(outputs, y_batch)
 
                     self.optimizer.zero_grad(set_to_none=True)
                     self.accelerator.backward(loss)
+                    utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                     self.optimizer.step()
 
                 train_losses.append(self.accelerator.gather(loss.detach()).mean().item())
