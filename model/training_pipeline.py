@@ -138,9 +138,9 @@ class StreamingDataset(Dataset):
         while not self.stop_event.is_set():
             try:
                 idx = i % len(self.paths)
-                vol = self._load_one(idx)
+                vol, mask = self._load_one(idx)
                 # blocks if queue is full (waits for model to consume)
-                self.queue.put((idx, vol))
+                self.queue.put((idx, vol, mask))
                 i += 1
             except Exception as e:
                 print(f"Prefetch error: {e}")
@@ -372,6 +372,7 @@ class TrainingPipeline:
         self.criterion = nn.BCEWithLogitsLoss()
         self.scheduler = optim.lr_scheduler.StepLR(self.optimizer, step_size=100, gamma=0.96) #Exponential decay scheduler
 
+
         self.model, self.optimizer = self.accelerator.prepare(self.model, self.optimizer)
         #Since we have to define our own training loop, we have to keep track
         #of these variables for best model, early stopping and learning rate decrease
@@ -389,16 +390,16 @@ class TrainingPipeline:
             self.model.train()
             train_losses, all_preds, all_labels = [], [], []
 
-            for x_batch, mask_batch, y_batch in tqdm(self.train_loader):
+            for x_batch, _, y_batch in tqdm(self.train_loader):
                 # y to float column vector
                 y_batch = y_batch.float().unsqueeze(1)
 
                 x_batch = x_batch.to(self.device, dtype=torch.float16, non_blocking=True)
-                mask_batch = mask_batch.to(self.device, dtype=torch.float16)
+                #mask_batch = mask_batch.to(self.device, dtype=torch.float16)
                 y_batch = y_batch.to(self.device, dtype=torch.float16, non_blocking=True)
 
                 x_batch, angles = rotate_batch_gpu(x_batch, mode='bilinear')
-                mask_batch, _ = rotate_batch_gpu(mask_batch, angles=angles, mode='nearest')
+                #mask_batch, _ = rotate_batch_gpu(mask_batch, angles=angles, mode='nearest')
                 with self.accelerator.accumulate(self.model):
                     with self.accelerator.autocast():
                         outputs = self.model(x_batch)
@@ -413,13 +414,13 @@ class TrainingPipeline:
                 # gather predictions/labels only for metrics
                 all_preds.append(outputs.detach())
                 all_labels.append(y_batch.detach())
-
-            all_preds = torch.cat(all_preds, dim=0).to(self.device, dtype=torch.float32).contiguous()
-            all_labels = torch.cat(all_labels, dim=0).to(self.device, dtype=torch.float32).contiguous()
+            print(len(all_preds))
+            all_preds = torch.cat(all_preds, dim=0)
+            all_labels = torch.cat(all_labels, dim=0)
 
             # Now safe to gather on GPU
-            all_preds  = self._safe_gather(all_preds)
-            all_labels = self._safe_gather(all_labels)
+            #all_preds  = self._safe_gather(all_preds)
+            #all_labels = self._safe_gather(all_labels)
 
             # Post-process on CPU
             probs = torch.sigmoid(all_preds)
@@ -440,7 +441,7 @@ class TrainingPipeline:
             val_losses = []
             val_preds_list, val_labels_list = [], []
             with torch.no_grad():
-                for x_batch, y_batch in self.val_loader:
+                for x_batch, _, y_batch  in self.val_loader:
                     y_batch = y_batch.float().unsqueeze(1)
                     with self.accelerator.autocast():
                         outputs = self.model(x_batch)

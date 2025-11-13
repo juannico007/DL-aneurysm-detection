@@ -47,7 +47,8 @@ def main():
         learning_rate=LEARNING_RATE,
         lr_reduction_patience = LEARNING_RATE_REDUCTION_EPOCHS,
         cache_size=CACHE_SIZE,
-        grad_accum_steps=GRADIENT_ACCUMULATION
+        grad_accum_steps=GRADIENT_ACCUMULATION,
+        radius=RADIUS
     )
     
     print("\n[4/5] Creating Pytorch dataloaders...")
