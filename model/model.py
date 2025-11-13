@@ -3,9 +3,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-
-
-
 class AneurysmDetectionModel(nn.Module):
     """A simple 3D CNN model for binary aneurysm classification."""
     
@@ -102,4 +99,3 @@ class AneurysmDetectionModel(nn.Module):
         
         
         return x
-    

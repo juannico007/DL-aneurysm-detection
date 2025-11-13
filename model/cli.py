@@ -6,6 +6,7 @@ import torch
 import torch.distributed as dist
 from torchsummary import summary
 import pickle
+import numpy as np
 
 import os
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
@@ -20,7 +21,7 @@ def main():
     EPOCHS = 10
     LEARNING_RATE = 0.0001
     TRAIN_RATIO = 0.7
-    LEARNING_RATE_REDUCTION_EPOCHS = 4
+    LEARNING_RATE_REDUCTION_EPOCHS = 6
     CACHE_SIZE = 8
     RADIUS = 15
     
