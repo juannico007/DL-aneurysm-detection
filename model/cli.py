@@ -43,7 +43,6 @@ def main():
     print("\n[3/5] Setting up training pipeline...")
     pipeline = TrainingPipeline(
         model=model,
-        pos_weight = (len(y_train) - np.sum(y_train)) / np.sum(y_train),
         batch_size=BATCH_SIZE,
         epochs=EPOCHS,
         learning_rate=LEARNING_RATE,

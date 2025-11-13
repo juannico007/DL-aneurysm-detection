@@ -198,7 +198,6 @@ class TrainingPipeline:
     def __init__(
         self,
         model: AneurysmDetectionModel,
-        pos_weight: int,
         batch_size: int = 4,
         epochs: int = 4,
         learning_rate : float = 1e-4,
@@ -229,7 +228,6 @@ class TrainingPipeline:
             checkpoint_path: Path to save best model
         """
         self.model = model
-        self.pos_weight = pos_weight
         self.batch_size = batch_size
         self.epochs = epochs
         self.learning_rate = learning_rate
@@ -371,9 +369,8 @@ class TrainingPipeline:
             betas = (0.9, 0.999),
             eps=1e-8,
             weight_decay=0.01)
-        self.criterion = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([self.pos_weight]).to(self.device, dtype=torch.bfloat16)) # for class imbalance parameter
-        # self.scheduler = optim.lr_scheduler.StepLR(self.optimizer, step_size=100, gamma=0.96) #Exponential decay scheduler
-        self.scheduler = optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=10)
+        self.criterion = nn.BCEWithLogitsLoss()
+        self.scheduler = optim.lr_scheduler.StepLR(self.optimizer, step_size=100, gamma=0.96) #Exponential decay scheduler
 
         self.model, self.optimizer = self.accelerator.prepare(self.model, self.optimizer)
         #Since we have to define our own training loop, we have to keep track
