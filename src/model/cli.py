@@ -16,8 +16,8 @@ HYPERPARAMS = {
     "csv_path": "train.csv",
     "localizer_csv": "train_localizers.csv",
     "input_shape": (256, 256, 256),
-    "batch_size": 2,
-    "grad_accum": 4,
+    "batch_size": 1,
+    "grad_accum": 2,
     "epochs": 1,
     "learning_rate": 1e-4,
     "weight_decay": 1e-2,
@@ -26,7 +26,8 @@ HYPERPARAMS = {
         "step_size": 100,
         "gamma": 0.96,
     },
-    "proportion_to_use": 0.5,
+    "proportion_to_use": 1,
+    "max_voxels": 128 * 256 * 256,
     # "scheduler":{
     #     "name" : "cosine",
     #     "eta_min": 1e-6
@@ -49,9 +50,9 @@ HYPERPARAMS = {
     "radius": 15,
     "unet": {
         "in_channels": 1,
-        "out_channels": 2,
+        "out_channels": 1,
         "n_blocks": 4,
-        "start_filters": 32,
+        "start_filters": 16,
         "activation": "relu",
         "normalization": "batch",
         "conv_mode": "same",
@@ -212,6 +213,7 @@ def main():
         h5_path=h5_path,
         csv_path=Path(hyperparams["csv_path"]),
         proportion_to_use=hyperparams["proportion_to_use"] if "proportion_to_use" in hyperparams else 1.0,
+        max_voxels=hyperparams.get("max_voxels"),
     )
     resolved_h5_path = Path(data_loader.h5_path)
     x_train, y_train, x_val, y_val = data_loader.split_data(train_ratio=hyperparams["train_ratio"])
@@ -222,11 +224,11 @@ def main():
     model = UNet(**unet_kwargs)
 
     if torch.cuda.is_available():
-        # Run the summary on CPU to avoid exhausting limited GPU VRAM
-        print(summary(model.to("cpu"), input_size=(1,) + input_shape, device="cpu"))
-        model = model.to(device)
-    else:
-        print(summary(model, input_size=(1,) + input_shape, device="cpu"))
+    #     # Run the summary on CPU to avoid exhausting limited GPU VRAM
+    #     print(summary(model.to("cpu"), input_size=(1,) + input_shape, device="cpu"))
+         model = model.to(device)
+    # else:
+    #     print(summary(model, input_size=(1,) + input_shape, device="cpu"))
 
     print("\n[3/5] Setting up training pipeline...")
     pipeline = TrainingPipeline(

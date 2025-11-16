@@ -19,6 +19,7 @@ class ScanDataLoader:
         h5_path: Path,
         csv_path: Path,
         proportion_to_use: float = 1.0,
+        max_voxels: Optional[int] = None,
     ):
         """Initialize the loader with dataset paths and optional sampling proportion."""
         train_channel = os.environ.get("SM_CHANNEL_TRAIN")
@@ -30,6 +31,7 @@ class ScanDataLoader:
         self.h5_path = self._resolve_data_path(Path(h5_path))
         self.csv_path = self._resolve_data_path(Path(csv_path))
         self.proportion_to_use = proportion_to_use
+        self.max_voxels = max_voxels
         self.series_ids: List[str] = []
         self.labels: List[int] = []
         self._load_dataset()
@@ -64,6 +66,17 @@ class ScanDataLoader:
                 if "vol" not in group:
                     print(f"[Warning] Missing 'vol' dataset for {pid}, skipping.")
                     continue
+
+                if self.max_voxels is not None:
+                    vol_ds = group["vol"]
+                    spatial_shape = vol_ds.shape[-3:]
+                    voxel_count = int(np.prod(spatial_shape))
+                    if voxel_count > self.max_voxels:
+                        print(
+                            f"[Info] Skipping {pid}: {voxel_count} voxels exceed limit "
+                            f"({self.max_voxels})."
+                        )
+                        continue
 
                 label = self._parse_label(row["Aneurysm Present"])
                 if label is None:
