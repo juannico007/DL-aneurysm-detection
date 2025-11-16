@@ -18,7 +18,24 @@ import pandas as pd
 
 import h5py
 
+class DiceLoss(nn.Module):
+    def __init__(self, weight=None, size_average=True):
+        super(DiceLoss, self).__init__()
 
+    def forward(self, inputs, targets, smooth=1):
+        
+        #comment out if your model contains a sigmoid or equivalent activation layer
+        inputs = F.sigmoid(inputs)       
+        
+        #flatten label and prediction tensors
+        inputs = inputs.view(-1)
+        targets = targets.view(-1)
+        
+        intersection = (inputs * targets).sum()                            
+        dice = (2.*intersection + smooth)/(inputs.sum() + targets.sum() + smooth)  
+        
+        return 1 - dice
+    
 def custom_collate(batch):
     data = [item[0] for item in batch]
     target = [item[1] for item in batch]
@@ -141,11 +158,11 @@ class AneurysmDataset(Dataset):
         pid = self.series_ids[idx]
         group = handle["series"][pid]
         volume = torch.from_numpy(group["vol"][:])
-        mask = (
-            self._build_mask(pid, volume.shape[-3:])
-            if self.localizer_points.get(str(pid))
-            else self._empty_mask(volume.shape[-3:])
-        )
+        centers = self.localizer_points.get(str(pid))
+        if centers is not None and len(centers):
+            mask = self._build_mask(pid, volume.shape[-3:])
+        else:
+            mask = self._empty_mask(volume.shape[-3:])
 
         if self.transform:
             volume = self.transform(volume)
@@ -390,7 +407,7 @@ class TrainingPipeline:
             betas = (0.9, 0.999),
             eps=1e-8,
             weight_decay=self.weight_decay)
-        self.criterion = nn.DiceLoss()
+        self.criterion = DiceLoss()
 
         self.model, self.optimizer = self.accelerator.prepare(self.model, self.optimizer)
         self._configure_scheduler()
@@ -421,7 +438,6 @@ class TrainingPipeline:
                 mask_batch, _ = rotate_batch_gpu(mask_batch, angles=angles, mode='nearest')
                 with self.accelerator.accumulate(self.model):
                     with self.accelerator.autocast():
-                        x_batch = rotate_batch_gpu(x_batch)
                         outputs = self.model(x_batch)
                         loss = self.criterion(outputs, mask_batch)
 
