@@ -18,26 +18,38 @@ class ScanDataLoader:
         self,
         h5_path: Path,
         csv_path: Path,
-        max_shape: Tuple[int, int, int] = (256, 256, 256),
+        proportion_to_use: float = 1.0,
     ):
+        """Initialize the loader with dataset paths and optional sampling proportion."""
         train_channel = os.environ.get("SM_CHANNEL_TRAIN")
         self.train_channel = Path(train_channel) if train_channel else None
 
+        if proportion_to_use <= 0 or proportion_to_use > 1:
+            raise ValueError("proportion_to_use must be in the (0, 1] range.")
+
         self.h5_path = self._resolve_data_path(Path(h5_path))
         self.csv_path = self._resolve_data_path(Path(csv_path))
-
-        self.max_shape = max_shape
+        self.proportion_to_use = proportion_to_use
         self.series_ids: List[str] = []
         self.labels: List[int] = []
         self._load_dataset()
 
     def _load_dataset(self) -> None:
+        """Read the CSV and enumerate the matching HDF5 entries while applying filters."""
         if not self.h5_path.exists():
             raise FileNotFoundError(f"HDF5 dataset not found: {self.h5_path}")
 
         df = self._load_csv()
         if "Aneurysm Present" not in df.columns:
             raise ValueError("'Aneurysm Present' column missing from labels CSV.")
+
+        if self.proportion_to_use < 1.0:
+            original_size = len(df)
+            df = df.sample(frac=self.proportion_to_use, random_state=None)
+            print(
+                "Using dataset subset: "
+                f"{len(df)}/{original_size} (~{self.proportion_to_use * 100:.1f}%) entries"
+            )
 
         with h5py.File(self.h5_path, "r") as handle:
             if "series" not in handle:
@@ -51,10 +63,6 @@ class ScanDataLoader:
                 group = series_group[pid]
                 if "vol" not in group:
                     print(f"[Warning] Missing 'vol' dataset for {pid}, skipping.")
-                    continue
-
-                shape = tuple(group["vol"].shape[-3:])
-                if not self._within_bounds(shape):
                     continue
 
                 label = self._parse_label(row["Aneurysm Present"])
@@ -72,6 +80,7 @@ class ScanDataLoader:
         )
 
     def _load_csv(self) -> pd.DataFrame:
+        """Return the labels CSV indexed by SeriesInstanceUID."""
         if not self.csv_path.exists():
             raise FileNotFoundError(f"CSV file not found: {self.csv_path}")
         df = pd.read_csv(self.csv_path)
@@ -81,6 +90,7 @@ class ScanDataLoader:
 
     @staticmethod
     def _parse_label(raw) -> Optional[int]:
+        """Convert a CSV label cell into an integer class or None on failure."""
         if isinstance(raw, bytes):
             raw = raw.decode("utf-8")
         try:
@@ -91,6 +101,7 @@ class ScanDataLoader:
     def split_data(
         self, train_ratio: float = 0.7
     ) -> Tuple[List[str], np.ndarray, List[str], np.ndarray]:
+        """Split collected series IDs into balanced train/validation partitions."""
         if not self.series_ids:
             raise ValueError("Dataset is empty. Ensure the HDF5 file is populated.")
 
@@ -126,6 +137,7 @@ class ScanDataLoader:
     def _split_indices(
         self, indices: np.ndarray, train_ratio: float
     ) -> Tuple[np.ndarray, np.ndarray]:
+        """Split a set of indices according to the provided train ratio."""
         if indices.size == 0:
             empty = np.empty(0, dtype=int)
             return empty, empty
@@ -134,15 +146,13 @@ class ScanDataLoader:
 
     @staticmethod
     def _concat_indices(parts: List[np.ndarray]) -> np.ndarray:
+        """Concatenate non-empty index arrays while preserving ordering per chunk."""
         filtered = [p for p in parts if p.size > 0]
         if not filtered:
             return np.empty(0, dtype=int)
         if len(filtered) == 1:
             return filtered[0].copy()
         return np.concatenate(filtered)
-
-    def _within_bounds(self, shape: Tuple[int, int, int]) -> bool:
-        return all(dim <= limit for dim, limit in zip(shape, self.max_shape))
 
     def _resolve_data_path(self, candidate: Path) -> Path:
         """Locate `candidate` relative to the SageMaker channel, repo root, or CWD."""

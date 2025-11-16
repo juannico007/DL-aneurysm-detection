@@ -14,16 +14,53 @@ MODE_ENV_VAR = "TRAINING_MODE"
 HYPERPARAMS = {
     "data_dir": "h5-aneurysm",
     "csv_path": "train.csv",
+    "localizer_csv": "train_localizers.csv",
     "input_shape": (256, 256, 256),
     "batch_size": 2,
     "grad_accum": 4,
-    "epochs": 5,
+    "epochs": 1,
     "learning_rate": 1e-4,
+    "weight_decay": 1e-2,
+    "scheduler": {
+        "name": "step",
+        "step_size": 100,
+        "gamma": 0.96,
+    },
+    "proportion_to_use": 0.5,
+    # "scheduler":{
+    #     "name" : "cosine",
+    #     "eta_min": 1e-6
+    # },
+
+    # "scheduler": {
+    #     "name": "plateau",
+    #     "mode": "min",
+    #     "factor": 0.5,
+    #     "patience": 10,
+    #     "min_lr": 1e-6,
+    # },
+
+    # "scheduler": {
+    #     "name": "onecycle",
+    # },
+    
     "train_ratio": 0.7,
     "lr_reduction_epochs": 4,
+    "radius": 15,
+    "unet": {
+        "in_channels": 1,
+        "out_channels": 2,
+        "n_blocks": 4,
+        "start_filters": 32,
+        "activation": "relu",
+        "normalization": "batch",
+        "conv_mode": "same",
+        "up_mode": "transposed",
+    },
 }
 
-ENV_FILE = Path(".env")
+REPO_ROOT = Path(__file__).resolve().parents[2]
+ENV_FILE = Path(__file__).resolve().parents[1] / ".env"
 
 
 def load_env_file(path: Path) -> None:
@@ -38,6 +75,20 @@ def load_env_file(path: Path) -> None:
                 continue
             key, value = line.split("=", 1)
             os.environ[key.strip()] = value.strip()
+
+
+def resolve_local_cloud_dir(github_user: str, model_name: str, model_version: str) -> Path:
+    """
+    Returns cloud_models/<user>/<model_version> under the repo root unless LOCAL_CLOUD_ROOT overrides it.
+    """
+    base_override = os.environ.get("LOCAL_CLOUD_ROOT")
+    if base_override:
+        base = Path(base_override).expanduser()
+        if not base.is_absolute():
+            base = REPO_ROOT / base
+    else:
+        base = REPO_ROOT / "cloud_models"
+    return base / github_user / f"{model_name}_{model_version}"
 
 
 def maybe_init_dist():
@@ -59,6 +110,8 @@ def maybe_init_dist():
 
 def main():
     hyperparams = HYPERPARAMS.copy()
+
+    # Code for choosing the mode (local vs cloud/SageMaker)
     mode = os.environ.get(MODE_ENV_VAR, hyperparams.get("mode", "local"))
     if mode not in {"local", "cloud"}:
         raise ValueError(f"Unsupported mode '{mode}'. Expected 'local' or 'cloud'.")
@@ -68,7 +121,7 @@ def main():
 
     if mode == "cloud":
         load_env_file(ENV_FILE)
-    elif "H5_PATH" not in os.environ and ENV_FILE.exists():
+    elif ENV_FILE.exists():
         load_env_file(ENV_FILE)
 
     github_user = os.environ.get("GITHUB_USER")
@@ -80,7 +133,7 @@ def main():
     # Heavy imports AFTER deps are ensured
 
     from .data_loader import ScanDataLoader
-    from .model import AneurysmDetectionModel
+    from .unet import UNet
     from .training_pipeline import TrainingPipeline
 
     input_shape = tuple(hyperparams["input_shape"])
@@ -91,7 +144,8 @@ def main():
 
     using_sagemaker = mode == "cloud"
     artifact_id = None
-    if using_sagemaker:
+    nest_artifact_subdir = False
+    if using_sagemaker: # save artifacts in cloud mode
         missing = [
             name
             for name, value in [
@@ -106,9 +160,32 @@ def main():
                 f"SageMaker runs require GitHub tagging. Missing env vars: {', '.join(missing)}"
             )
         artifact_id = f"{github_user}_{model_name}_{model_version}"
+        nest_artifact_subdir = True
+    else: # save artifacts in local mode
+        local_missing = [
+            name
+            for name, value in [
+                ("GITHUB_USER", github_user),
+                ("RUN_MODEL_NAME", model_name),
+                ("RUN_MODEL_VERSION", model_version),
+            ]
+            if not value
+        ]
+        if local_missing:
+            print(
+                "Local run: cloud_models export disabled because these env vars are missing: "
+                + ", ".join(local_missing)
+            )
+        else:
+            artifact_id = f"{github_user}_{model_name}_{model_version}"
+            local_artifact_root = resolve_local_cloud_dir(github_user, model_name, model_version)
+            model_dir = local_artifact_root
+            output_dir = local_artifact_root
+            print(f"Local artifacts will be stored in {local_artifact_root}")
 
-    model_artifact_dir = model_dir / artifact_id if artifact_id else model_dir
-    output_artifact_dir = output_dir / artifact_id if artifact_id else output_dir
+    # artifact directories
+    model_artifact_dir = model_dir / artifact_id if artifact_id and nest_artifact_subdir else model_dir
+    output_artifact_dir = output_dir / artifact_id if artifact_id and nest_artifact_subdir else output_dir
     model_artifact_dir.mkdir(parents=True, exist_ok=True)
     output_artifact_dir.mkdir(parents=True, exist_ok=True)
 
@@ -118,14 +195,8 @@ def main():
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
+    # get the h5 path both for local and cloud runs
     def resolve_h5_path(preferred: Path) -> Path:
-        env_value = os.environ.get("H5_PATH")
-        if env_value:
-            path = Path(env_value).expanduser()
-            if path.is_absolute():
-                return path
-            return Path(".") / path
-
         train_channel = os.environ.get("SM_CHANNEL_TRAIN")
         preferred = Path(preferred)
         if preferred.is_absolute():
@@ -140,15 +211,22 @@ def main():
     data_loader = ScanDataLoader(
         h5_path=h5_path,
         csv_path=Path(hyperparams["csv_path"]),
+        proportion_to_use=hyperparams["proportion_to_use"] if "proportion_to_use" in hyperparams else 1.0,
     )
     resolved_h5_path = Path(data_loader.h5_path)
     x_train, y_train, x_val, y_val = data_loader.split_data(train_ratio=hyperparams["train_ratio"])
 
     print("\n[2/5] Building model...")
-    model = AneurysmDetectionModel(input_shape=input_shape)
+
+    unet_kwargs = dict(hyperparams.get("unet", {}))
+    model = UNet(**unet_kwargs)
+
     if torch.cuda.is_available():
+        # Run the summary on CPU to avoid exhausting limited GPU VRAM
+        print(summary(model.to("cpu"), input_size=(1,) + input_shape, device="cpu"))
         model = model.to(device)
-        print(summary(model, input_size=(1,) + input_shape))
+    else:
+        print(summary(model, input_size=(1,) + input_shape, device="cpu"))
 
     print("\n[3/5] Setting up training pipeline...")
     pipeline = TrainingPipeline(
@@ -156,9 +234,13 @@ def main():
         batch_size=hyperparams["batch_size"],
         epochs=hyperparams["epochs"],
         learning_rate=hyperparams["learning_rate"],
+        weight_decay=hyperparams["weight_decay"],
         lr_reduction_patience=hyperparams["lr_reduction_epochs"],
         grad_accum_steps=hyperparams["grad_accum"],
         checkpoint_path=str(checkpoint_path),
+        radius=hyperparams["radius"],
+        localizer_csv=hyperparams.get("localizer_csv"),
+        scheduler_config=hyperparams["scheduler"],
     )
 
     print("\n[4/5] Creating Pytorch dataloaders...")
@@ -167,7 +249,7 @@ def main():
         x_train=x_train,
         y_train=y_train,
         x_val=x_val,
-        y_val=y_val,
+        y_val=y_val
     )
 
     print("\n[5/5] Training model...")
@@ -176,23 +258,28 @@ def main():
     print("Training completed!")
     print(f"Best model saved to: {pipeline.checkpoint_path}")
 
+    # save history
     history_path.parent.mkdir(parents=True, exist_ok=True)
     with open(history_path, "wb") as handle:
         pickle.dump(history, handle, protocol=pickle.HIGHEST_PROTOCOL)
     print(f"History saved to {history_path}")
 
+    # save hyperparameters
     hyperparams_path = output_artifact_dir / "hyperparameters.json"
     with open(hyperparams_path, "w", encoding="utf-8") as handle:
         json.dump(hyperparams, handle, indent=2, sort_keys=True)
     print(f"Hyperparameters saved to {hyperparams_path}")
 
+    # save metadata
     if artifact_id:
         metadata = {
             "artifact_id": artifact_id,
             "github_user": github_user,
             "model_name": model_name,
             "model_version": model_version,
-            "training_job_name": os.environ.get("TRAINING_JOB_NAME", "sagemaker"),
+            "training_job_name": os.environ.get(
+                "TRAINING_JOB_NAME", "sagemaker" if using_sagemaker else "local-run"
+            ),
             "timestamp": datetime.utcnow().isoformat() + "Z",
             "files": {
                 "checkpoint": checkpoint_path.name,
