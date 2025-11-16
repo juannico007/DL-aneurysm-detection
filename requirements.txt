@@ -12,3 +12,4 @@ torchsummary>=1.5.1
 torchvision>=0.24.0
 tqdm>=4.67.1
 transformers>=4.46
+boto3>=1.35.30

@@ -2,7 +2,7 @@ compute_environment: LOCAL_MACHINE
 debug: false
 
 deepspeed_config:
-  deepspeed_config_file: model/ds_config.json
+  deepspeed_config_file: src/model/ds_config.json
   zero3_init_flag: false
 distributed_type: DEEPSPEED
 downcast_bf16: 'no'

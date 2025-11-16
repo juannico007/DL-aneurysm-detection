@@ -1,0 +1,20 @@
+base_job_name: accelerate-sagemaker-1
+compute_environment: AMAZON_SAGEMAKER
+debug: true
+distributed_type: 'NO'
+ec2_instance_type: ml.g5.4xlarge
+enable_cpu_affinity: false
+gpu_ids: all
+iam_role_name: arn:aws:iam::393847600789:role/service-role/AmazonSageMaker-ExecutionRole-20251111T190751
+mixed_precision: fp16
+num_machines: 1
+py_version: py311
+pytorch_version: 2.3.0
+region: eu-north-1
+sagemaker_inputs_file: configs/sagemaker_inputs.tsv
+sagemaker_metrics_file: configs/sagemaker_metrics.tsv
+transformers_version: 4.46.1
+use_cpu: false
+additional_args:
+  dependencies:
+    - requirements.txt

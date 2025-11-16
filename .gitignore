@@ -184,7 +184,7 @@ pyrightconfig.json
 *.ckpt.*
 *.h5
 *.pth
-*.pt
+# *.pt (Now we accept all the models on the github repo)
 *.tflite
 *.onnx
 *.pb

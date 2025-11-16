@@ -1,56 +1,32 @@
-## Migration (from v0.0.2 → v0.0.3)
+## Migration (from v0.0.3 → v0.0.6)
 
 This release introduces major internal optimizations and changes to the data pipeline, model definition, and training setup.  
 Follow these steps to migrate from previous versions.
 
 
-- Preprocess now with the new outputs `.npz`. Last version returned `.nii.qz`.
-Run:
+1.  Install the new dependencies:
 ```bash
-python3 -m preprocessing.cli
+pip install accelerate[sagemaker] boto3 python-dotenv h5py
 ```
 
-- Run new depndencies and make sure to be in the right environment: 
+2. Run the `patch_accelerate_config.py` script to fix the Accelerate bug:
+
 ```bash
-pip install -r requirements.txt
+python3 scripts/patch_accelerate_config.py
 ```
 
-- Setup the accelerate
+3. Create a `.env` file in the `src` folder and add the secret values
+
+4. If you run locally, make sure to have h5-aneurysm.h5 file in the root folder and the train.csv file. 
+
+5. You can launch training either locally or on the cloud (SageMaker):
 ```bash
-accelerate config
+python src/run_training.py --mode local
 ```
 
-Make sure to be similar as those variables: 
+or
 
-```text
-compute_environment: LOCAL_MACHINE
-debug: false
-deepspeed_config:
-  deepspeed_config_file: model/ds_config.json
-  zero3_init_flag: false
-distributed_type: DEEPSPEED
-downcast_bf16: 'no'
-dynamo_config:
-  dynamo_backend: INDUCTOR
-  dynamo_mode: reduce-overhead
-  dynamo_use_dynamic: true
-  dynamo_use_fullgraph: true
-  dynamo_use_regional_compilation: true
-enable_cpu_affinity: false
-machine_rank: 0
-main_training_function: main
-num_machines: 1
-num_processes: 1
-rdzv_backend: static
-same_network: true
-tpu_env: []
-tpu_use_cluster: false
-tpu_use_sudo: false
-use_cpu: false
-```
-
-- Run the model:
 ```bash
-accelerate launch -m model.cli
+python src/run_training.py --mode cloud
 ```
 

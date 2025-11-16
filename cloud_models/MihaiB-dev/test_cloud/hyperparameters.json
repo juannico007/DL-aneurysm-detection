@@ -1,0 +1,17 @@
+{
+  "batch_size": 2,
+  "cache_size": 8,
+  "csv_path": "train.csv",
+  "device": "cuda",
+  "epochs": 5,
+  "grad_accum": 4,
+  "h5_path": "/opt/ml/input/data/train/h5-aneurysm",
+  "input_shape": [
+    256,
+    256,
+    256
+  ],
+  "learning_rate": 0.0001,
+  "lr_reduction_epochs": 4,
+  "train_ratio": 0.7
+}
