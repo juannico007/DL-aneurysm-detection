@@ -1,6 +1,32 @@
 # Changelog
 All notable changes to this project will be documented here. If needed, images with the model will be shown. 
 
+## [0.0.6] - 2025-11-26
+
+### Added
+- Cloud training support with AWS SageMaker using Hugging Face Accelerate.
+- Model versioning system based on GitHub username, model name, and version.
+- Scripts to pull trained models from S3 and view SageMaker training logs from the command line
+- `.env` configuration support for sensitive information like AWS credentials.
+
+### Changed
+- Data loading pipeline switched from multiple `.npz` files to a single HDF5 file
+- Training entry point updated to `run_training.py` with `--mode` argument for local or cloud execution.
+- New `AneurysmDataset` class for efficient data loading from HDF5 files.
+
+### Fixed
+- Accelerate configuration bug fixed via a patch script.
+
+### Deprecated
+- Old data loading methods using `.npz` files.
+
+### Performance
+
+| Configuration                   | Model Size | Parameters | Dataset       | Hardware                                             | Training Time per 1 epoch |
+| ------------------------------- | ---------- | ---------- | ------------- | ---------------------------------------------------- | -------------- |
+| Local | ~3 GB      | 328,001    | 777 CTA scans | RTX 4060 (8 GB VRAM), 24 GB RAM, Intel i9                            | **~3:45 minutes**  |
+| Cloud   | ~3 GB      | 328,001     | 777 CTA scans | NVIDIA A10G (24 GB VRAM), 16 GB RAM, AMD EPYC 7R32 | **~1:45 minutes** |
+
 ## [0.0.3] - 2025-10-25
 
 ### Added
@@ -16,7 +42,6 @@ All notable changes to this project will be documented here. If needed, images w
 - All volumes converted from `float32` to `float16` for memory reduction.
 - Removed sigmoid from model forward pass; use `BCEWithLogitsLoss` instead.
 - Training optimized with Hugging Face Accelerate and 8-bit Adam optimizer.
-- Added `cache_size` parameter to limit dataset memory usage.
 - Datasets now pad dynamically to batch’s max size (multiple of 16).
 
 ### Fixed

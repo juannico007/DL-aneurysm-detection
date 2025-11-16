@@ -1,0 +1,27 @@
+{
+  "artifact_id": "MihaiB-dev_test_001",
+  "bucket": "sagemaker-eu-north-1-393847600789",
+  "cli_args": {
+    "batch_size": 2,
+    "epochs": 5,
+    "grad_accum": 4,
+    "learning_rate": 0.0001
+  },
+  "downloaded_at": "2025-11-16T00:46:25.102685Z",
+  "files": {
+    "checkpoint": "MihaiB-dev_test_001.pt",
+    "history": "history.pickle",
+    "hyperparameters": "hyperparameters.json"
+  },
+  "github_user": "MihaiB-dev",
+  "model_name": "test",
+  "model_version": "001",
+  "prefix": "",
+  "s3_job_name": "accelerate-sagemaker-1-2025-11-15-22-44-56-480",
+  "storage": {
+    "model_subdir": "MihaiB-dev_test_001",
+    "output_subdir": "MihaiB-dev_test_001"
+  },
+  "timestamp": "2025-11-15T23:06:45.415898Z",
+  "training_job_name": "accelerate-sagemaker-1-2025-11-15-22-44-56-480"
+}
