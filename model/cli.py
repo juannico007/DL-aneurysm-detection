@@ -6,6 +6,7 @@ import torch
 import torch.distributed as dist
 from torchsummary import summary
 import pickle
+import numpy as np
 
 import os
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
@@ -13,15 +14,16 @@ os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 def main():
     """Entrypoint for preparing model and training with preprocessed images."""
     DATA_DIR = Path("ct_preprocessed/series")
-    CSV_PATH = Path("ct_subset/train.csv")
+    CSV_PATH = Path("ct_preprocessed/train.csv")
     INPUT_SHAPE = (256, 256, 256)
     BATCH_SIZE = 2
     GRADIENT_ACCUMULATION = 4 # simmulate: batch_size = batch_size * gradient_accumulation
-    EPOCHS = 5
+    EPOCHS = 10
     LEARNING_RATE = 0.0001
     TRAIN_RATIO = 0.7
-    LEARNING_RATE_REDUCTION_EPOCHS = 4
+    LEARNING_RATE_REDUCTION_EPOCHS = 6
     CACHE_SIZE = 8
+    RADIUS = 15
     
     device = "cuda"
 
@@ -29,7 +31,7 @@ def main():
         dist.init_process_group(backend="gloo")
     
     print("\n[1/5] Loading dataset...")
-    data_loader = ScanDataLoader(DATA_DIR, CSV_PATH)
+    data_loader = ScanDataLoader(DATA_DIR, CSV_PATH, proportion_to_use=0.15)
     x_train, y_train, x_val, y_val = data_loader.split_data(train_ratio=TRAIN_RATIO)
     
     print("\n[2/5] Building model...")
@@ -46,7 +48,8 @@ def main():
         learning_rate=LEARNING_RATE,
         lr_reduction_patience = LEARNING_RATE_REDUCTION_EPOCHS,
         cache_size=CACHE_SIZE,
-        grad_accum_steps=GRADIENT_ACCUMULATION
+        grad_accum_steps=GRADIENT_ACCUMULATION,
+        radius=RADIUS
     )
     
     print("\n[4/5] Creating Pytorch dataloaders...")

@@ -5,7 +5,7 @@ from .pipeline import Preprocess
 def main():
     """Entry point for running preprocessing with the default configuration."""
     p = Preprocess(
-        input_root=Path("mini-rsna-intracranial-aneurysm-detection"),
+        input_root=Path("ct_subset"),
         output_root=Path("ct_preprocessed"),
         voxel_size=(1, 1, 1),
         shape=(256, 256, 256),
