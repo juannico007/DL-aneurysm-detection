@@ -1,4 +1,4 @@
-from email import utils
+from torch.nn import utils
 from .unet import UNet
 from .data_augmentation import DataAugmentation, rotate_batch_gpu
 from sklearn.metrics import accuracy_score, f1_score, fbeta_score
