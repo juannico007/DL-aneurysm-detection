@@ -293,6 +293,12 @@ class ClassifierBlock(nn.Module):
         self.dropout = nn.Dropout(self.drop)
         self.fc2 = nn.Linear(self.middle_neurons, self.out_neurons)
 
+    def initialize_classifier(self):
+        nn.init.kaiming_uniform_(self.fc1.weight, a=0, mode='fan_in', nonlinearity='relu')
+        nn.init.zeros_(self.fc1.bias)
+        nn.init.kaiming_uniform_(self.fc2.weight, a=0, mode='fan_in', nonlinearity='relu')
+        nn.init.zeros_(self.fc2.bias)
+
     def forward(self, encoded_features):
         self.activations = []
         y = self.gap(encoded_features)
@@ -381,6 +387,7 @@ class UNet(nn.Module):
                                            middle_neurons=self.middle_neurons,
                                            drop=self.dropout,
                                            activation=self.activation)
+        self.class_block.initialize_classifier()
 
         # Decoder
         for i in range(n_blocks - 1):

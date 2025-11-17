@@ -49,18 +49,22 @@ class SegmentationClassificationLoss(nn.Module):
     Returns: 
         Loss value for the patient
     """
-    def __init__(self, segmentation = DiceLoss, classification = nn.BCELoss, weights=[0.5, 0.5], size_average=True):
+    def __init__(self, segmentation = DiceLoss, classification = nn.BCEWithLogitsLoss, weights=[0.5, 0.5], size_average=True):
         super(SegmentationClassificationLoss, self).__init__()
         self.weights = weights
         self.segmentation = segmentation
         self.classification = classification
 
-    def forward(self, inputs, targets):
+    def forward(self, inputs, targets, device):
         #Divide inputs and targets for dice loss and bce
         segmentation_input = inputs[0]
         classification_input = inputs[1]
         segmentation_target = targets[0]
         classification_target = targets[1]
+        classification_input = classification_input.to(device=device, dtype=torch.float32) 
+        classification_target = classification_target.to(device=device, dtype=torch.float32) 
+        print("IN LOSS - seg_in.dtype, device, requires_grad:", segmentation_input.dtype, segmentation_input.device, segmentation_input.requires_grad)
+        print("IN LOSS - cls_in.dtype, device, requires_grad:", classification_input.dtype, classification_input.device, classification_input.requires_grad)
         
         segmentation_loss = self.segmentation(segmentation_input, segmentation_target)
         classification_loss = self.classification(classification_input, classification_target)
@@ -403,7 +407,11 @@ class TrainingPipeline:
         # Get max size across processes
         local_size = torch.tensor(tensor.shape[0], device=self.device)
         all_sizes = self.accelerator.gather(local_size)
-        max_size = all_sizes.max().item()
+        if not torch.is_tensor(all_sizes):
+            all_sizes = torch.tensor([all_sizes], device=self.device)
+        else:
+            all_sizes = all_sizes.to(self.device)
+        max_size = all_sizes.max().item() if all_sizes.numel() else 0
         
         # Pad to max size
         current_size = tensor.shape[0]
@@ -415,9 +423,12 @@ class TrainingPipeline:
         if max_size == 0:
             return gathered
 
+        sizes_list = all_sizes.tolist()
+        if isinstance(sizes_list, (int, float)):
+            sizes_list = [sizes_list]
         masks = [
             (torch.arange(max_size, device=self.device) < size)
-            for size in all_sizes.tolist()
+            for size in sizes_list
         ]
         valid_mask = torch.stack(masks, dim=0).flatten()
         return gathered[valid_mask]
@@ -475,12 +486,22 @@ class TrainingPipeline:
                 with self.accelerator.accumulate(self.model):
                     with self.accelerator.autocast():
                         outputs = self.model(x_batch)
-                        loss = self.criterion(outputs, (mask_batch, y_batch))
+                    #print("Classifier logits min/max:", outputs[1].min(), outputs[1].max())
+                    loss = self.criterion(outputs, (mask_batch, y_batch), self.device)
+                    # just before accelerator.backward(loss)
+                    #print("LOSS:", loss, "device:", loss.device, "dtype:", loss.dtype, "requires_grad:", loss.requires_grad)
+                    seg_logits, cls_logits = outputs
+                    #print("seg_logits.requires_grad:", seg_logits.requires_grad, "device:", seg_logits.device, "dtype:", seg_logits.dtype)
+                    #print("cls_logits.requires_grad:", cls_logits.requires_grad, "device:", cls_logits.device, "dtype:", cls_logits.dtype)
+                    with torch.autograd.set_detect_anomaly(True):
+                        self.accelerator.backward(loss)
 
-                    self.optimizer.zero_grad(set_to_none=True)
-                    self.accelerator.backward(loss)
-                    utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                    # IMPORTANT — only clip when gradients exist
+                    if self.accelerator.sync_gradients:
+                        self.accelerator.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+
                     self.optimizer.step()
+                    self.optimizer.zero_grad(set_to_none=True)
                     if self.scheduler and self.scheduler_step_mode == "batch":
                         self.scheduler.step()
 
@@ -540,7 +561,7 @@ class TrainingPipeline:
                     y_batch = y_batch.to(self.device, dtype=torch.float16, non_blocking=True)
                     with self.accelerator.autocast():
                         outputs = self.model(x_batch)
-                        loss = self.criterion(outputs, (mask_batch, y_batch))
+                        loss = self.criterion(outputs, (mask_batch, y_batch), self.device)
                     val_losses.append(self.accelerator.gather(loss.detach()).mean().item())
 
                     #DICE loss

@@ -1,7 +1,7 @@
 import matplotlib.pyplot as plt
 import pickle
 
-history_path = "../history.pickle"
+history_path = "../../cloud_models/juannico007/Nico_001/history.pickle"
 with open(history_path, 'rb') as handle:
     history = pickle.load(handle)
 
@@ -23,5 +23,15 @@ plt.xlabel("Epoch")
 plt.ylabel("Accuracy")
 plt.legend()
 output_path = "accuracies.png"
+fig.savefig(output_path, dpi=220, bbox_inches="tight")
+plt.close(fig)
+
+fig = plt.figure()
+plt.plot(history["train_dice"], label = "train dice")
+plt.plot(history["val_dice"], label = "val dice")
+plt.xlabel("Epoch")
+plt.ylabel("DICE score")
+plt.legend()
+output_path = "dice.png"
 fig.savefig(output_path, dpi=220, bbox_inches="tight")
 plt.close(fig)
