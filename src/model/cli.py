@@ -18,7 +18,7 @@ HYPERPARAMS = {
     "input_shape": (256, 256, 256),
     "batch_size": 1,
     "grad_accum": 2,
-    "epochs": 1,
+    "epochs": 10,
     "learning_rate": 1e-4,
     "weight_decay": 1e-2,
     "scheduler": {
@@ -26,7 +26,7 @@ HYPERPARAMS = {
         "step_size": 100,
         "gamma": 0.96,
     },
-    "proportion_to_use": 1,
+    "proportion_to_use": 0.1,
     "max_voxels": 128 * 256 * 256,
     # "scheduler":{
     #     "name" : "cosine",
@@ -54,9 +54,12 @@ HYPERPARAMS = {
         "n_blocks": 4,
         "start_filters": 16,
         "activation": "relu",
-        "normalization": "batch",
+        "normalization": "group4",
         "conv_mode": "same",
         "up_mode": "transposed",
+        "middle_neurons": 256,
+        "class_output": 1,
+        "dropout": 0
     },
 }
 

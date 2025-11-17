@@ -164,12 +164,15 @@ class DownBlock(nn.Module):
             self.norm2 = get_normalization(normalization=self.normalization, num_channels=self.out_channels)
 
     def forward(self, x):
+        self.activations = []
         y = self.conv1(x)
         y = self.act1(y)
+        self.activations.append(y)
         if self.normalization:
             y = self.norm1(y)
         y = self.conv2(y)
         y = self.act2(y)
+        self.activations.append(y)
         if self.normalization:
             y = self.norm2(y)
 
@@ -230,24 +233,77 @@ class UpBlock(nn.Module):
         self.concat = Concatenate()
 
     def forward(self, encoder_layer, decoder_layer):
+        self.activations = []
         up_layer = self.up(decoder_layer)
         cropped_encoder_layer, dec_layer = autocrop(encoder_layer, up_layer)
 
         if self.up_mode != 'transposed':
             up_layer = self.conv1(up_layer)
         up_layer = self.act1(up_layer)
+        self.activations.append(up_layer)
         if self.normalization:
             up_layer = self.norm1(up_layer)
 
         merged_layer = self.concat(up_layer, cropped_encoder_layer)
         y = self.conv2(merged_layer)
         y = self.act2(y)
+        self.activations.append(y)
         if self.normalization:
             y = self.norm2(y)
         y = self.conv3(y)
         y = self.act3(y)
+        self.activations.append(y)
         if self.normalization:
             y = self.norm3(y)
+        return y
+    
+class ClassifierBlock(nn.Module):
+    """
+    Classifier block with fully layers outputing n binary classes.
+
+    Parameters:
+        in_channels: Number of input channels
+        middle_neurons: Number of neurons in the middle layer
+        out_neurons: Number of output neurons
+        drop: Dropout rate in the middle layer
+        activation: Activation function name
+    Returns:
+        classification output.
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_neurons: int,
+        middle_neurons: int,
+        drop: float,
+        activation: str = 'relu'
+    ):
+        super().__init__()
+
+        self.in_channels = in_channels
+        self.middle_neurons = middle_neurons
+        self.out_neurons = out_neurons
+        self.drop = drop
+        self.activation = activation
+
+        self.gap = nn.AdaptiveAvgPool3d(1)
+        self.fc1 = nn.Linear(self.in_channels, self.middle_neurons)
+        self.act1 = get_activation(self.activation)
+        self.dropout = nn.Dropout(self.drop)
+        self.fc2 = nn.Linear(self.middle_neurons, self.out_neurons)
+
+    def forward(self, encoded_features):
+        self.activations = []
+        y = self.gap(encoded_features)
+        y = y.view(y.size(0), -1)
+
+        y = self.fc1(y)
+        y = self.act1(y)
+        self.activations.append(y)
+        y = self.dropout(y)
+        y = self.fc2(y)
+        self.activations.append(y)
         return y
     
 class UNet(nn.Module):
@@ -263,7 +319,9 @@ class UNet(nn.Module):
         normalization: Normalization type. Defaults to 'batch'
         conv_mode: 'same' or 'valid'. Defaults to 'same'
         up_mode: 'transposed' or interpolation mode. Defaults to 'transposed'.
-
+        middle_neurons: number of middle neurons for classifier block
+        class_output: number of output neurons in the classifier
+        dropout: dropout rate in the classifier
     Returns:
         Final output feature map.
     """
@@ -276,7 +334,10 @@ class UNet(nn.Module):
         activation: str = 'relu',
         normalization: str = 'batch',
         conv_mode: str = 'same',
-        up_mode: str = 'transposed'
+        up_mode: str = 'transposed',
+        middle_neurons: int = 256,
+        class_output: int = 1,
+        dropout: float = 0,
     ):
         super().__init__()
 
@@ -288,9 +349,13 @@ class UNet(nn.Module):
         self.normalization = normalization
         self.conv_mode = conv_mode
         self.up_mode = up_mode
+        self.middle_neurons = middle_neurons
+        self.class_outputs = class_output
+        self.dropout = dropout
 
         self.down_blocks = []
         self.up_blocks = []
+        self.layer_activations = []
 
         # Encoder
         for i in range(self.n_blocks):
@@ -308,6 +373,14 @@ class UNet(nn.Module):
             )
 
             self.down_blocks.append(down_block)
+
+        #Auxiliary classifier
+        num_channels = self.start_filters * (2 ** (self.n_blocks-1))
+        self.class_block = ClassifierBlock(in_channels=num_channels, 
+                                           out_neurons=self.class_outputs, 
+                                           middle_neurons=self.middle_neurons,
+                                           drop=self.dropout,
+                                           activation=self.activation)
 
         # Decoder
         for i in range(n_blocks - 1):
@@ -355,16 +428,22 @@ class UNet(nn.Module):
             self.bias_init(module, method_bias, **kwargs_bias)
 
     def forward(self, x: torch.tensor):
-        encoder_output = []
-
+        self.encoder_output = []
+        self.activations = []
         for module in self.down_blocks:
             x, before_pooling = module(x)
-            encoder_output.append(before_pooling)
+            self.activations += module.activations
+            self.encoder_output.append(before_pooling)
+
+        class_output = self.class_block(x)
 
         for i, module in enumerate(self.up_blocks):
-            before_pool = encoder_output[-(i + 2)]
+            before_pool = self.encoder_output[-(i + 2)]
             x = module(before_pool, x)
+            self.activations += module.activations
 
         x = self.final_conv(x)
+        self.activations.append(x)
 
-        return x
+        self.activations += self.class_block.activations
+        return x, class_output

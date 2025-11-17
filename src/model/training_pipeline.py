@@ -39,6 +39,33 @@ class DiceLoss(nn.Module):
         dice = (2.*intersection + smooth)/(inputs_sum.sum() + targets_sum.sum() + smooth)  
         return 1 - dice
     
+class SegmentationClassificationLoss(nn.Module):
+    """
+    Class for dice loss with bce for classification
+    Parameters:
+        weights: array with 2 values, segmentation weight and classification weight for the loss
+        segmentation: Function to evaluate the segmentation loss
+        classification: Function to evaluate the classification loss
+    Returns: 
+        Loss value for the patient
+    """
+    def __init__(self, segmentation = DiceLoss, classification = nn.BCELoss, weights=[0.5, 0.5], size_average=True):
+        super(SegmentationClassificationLoss, self).__init__()
+        self.weights = weights
+        self.segmentation = segmentation
+        self.classification = classification
+
+    def forward(self, inputs, targets):
+        #Divide inputs and targets for dice loss and bce
+        segmentation_input = inputs[0]
+        classification_input = inputs[1]
+        segmentation_target = targets[0]
+        classification_target = targets[1]
+        
+        segmentation_loss = self.segmentation(segmentation_input, segmentation_target)
+        classification_loss = self.classification(classification_input, classification_target)
+        return self.weights[0] * segmentation_loss + self.weights[1] * classification_loss
+    
 def custom_collate(batch):
     data = [item[0] for item in batch]
     target = [item[1] for item in batch]
@@ -195,6 +222,7 @@ class TrainingPipeline:
         radius: float = 5.0,
         localizer_csv: Optional[Path] = None,
         scheduler_config: Optional[Dict[str, Any]] = None,
+        weights : list = [0.5,0.5]
     ):
         """
         Initialize training pipeline.
@@ -210,6 +238,7 @@ class TrainingPipeline:
             lr_reduction_factor: Learning rate reduction on plateau
             min_lr: Minimum value for the learning rate
             checkpoint_path: Path to save best model
+            weights: Weight distribution for segmentation/classification
         """
         self.model = model
         self.batch_size = batch_size
@@ -228,6 +257,7 @@ class TrainingPipeline:
             "step_size": 100,
             "gamma": 0.96,
         }
+        self.weights = weights
 
         self.scheduler_step_mode: Optional[str] = None
         self.scheduler: Optional[optim.lr_scheduler._LRScheduler] = None
@@ -410,13 +440,14 @@ class TrainingPipeline:
             betas = (0.9, 0.999),
             eps=1e-8,
             weight_decay=self.weight_decay)
-        self.criterion = DiceLoss()
-
+        self.segmentation_loss = DiceLoss()
+        self.classification_loss = nn.BCEWithLogitsLoss()
+        self.criterion = SegmentationClassificationLoss(self.segmentation_loss, self.classification_loss, weights=self.weights)
         self.model, self.optimizer = self.accelerator.prepare(self.model, self.optimizer)
         self._configure_scheduler()
         #Since we have to define our own training loop, we have to keep track
         #of these variables for best model, early stopping and learning rate decrease
-        best_val_acc = 0
+        best_val_loss = 1
         epochs_no_improve = 0
         lr_plateau_counter = 0
 
@@ -431,18 +462,20 @@ class TrainingPipeline:
         for epoch in range(1, self.epochs + 1):
             self.model.train()
             train_losses = []
-            train_scan_preds, train_scan_labels, train_dice_scores = [], [], []
+            train_dice_scores = []
+            all_preds, all_labels = [], []
 
-            for x_batch, mask_batch, _ in tqdm(self.train_loader):
+            for x_batch, mask_batch, y_batch in tqdm(self.train_loader):
                 x_batch = x_batch.to(self.device, dtype=torch.float16, non_blocking=True)
                 mask_batch = mask_batch.to(self.device, dtype=torch.float16, non_blocking=True)
-
+                y_batch = y_batch.float().unsqueeze(1)
+                y_batch = y_batch.to(self.device, dtype=torch.float16, non_blocking=True)
                 x_batch, angles = rotate_batch_gpu(x_batch, mode='bilinear')
                 mask_batch, _ = rotate_batch_gpu(mask_batch, angles=angles, mode='nearest')
                 with self.accelerator.accumulate(self.model):
                     with self.accelerator.autocast():
                         outputs = self.model(x_batch)
-                        loss = self.criterion(outputs, mask_batch)
+                        loss = self.criterion(outputs, (mask_batch, y_batch))
 
                     self.optimizer.zero_grad(set_to_none=True)
                     self.accelerator.backward(loss)
@@ -453,14 +486,11 @@ class TrainingPipeline:
 
                 train_losses.append(self.accelerator.gather(loss.detach()).mean().item())
 
+                #Dice calculation
                 with torch.no_grad():
-                    probs = torch.sigmoid(outputs.detach().to(torch.float32))
+                    mask_probs = torch.sigmoid(outputs[0].detach().to(torch.float32))
                     targets = mask_batch.detach().to(torch.float32)
-                    pred_masks = (probs >= 0.5).float()
-                    scan_pred = pred_masks.flatten(start_dim=1).any(dim=1).float()
-                    scan_label = targets.flatten(start_dim=1).any(dim=1).float()
-                    train_scan_preds.append(scan_pred)
-                    train_scan_labels.append(scan_label)
+                    pred_masks = (mask_probs >= 0.5).float()
 
                     pred_sum = pred_masks.sum(dim=(1, 2, 3, 4))
                     target_sum = targets.sum(dim=(1, 2, 3, 4))
@@ -468,17 +498,24 @@ class TrainingPipeline:
                     dice = (2.0 * intersection + eps) / (pred_sum + target_sum + eps)
                     train_dice_scores.append(dice)
 
-            train_scan_preds = torch.cat(train_scan_preds, dim=0).to(self.device, dtype=torch.float32)
-            train_scan_labels = torch.cat(train_scan_labels, dim=0).to(self.device, dtype=torch.float32)
+                #Accuracy calculation
+                all_preds.append(outputs[1].detach())
+                all_labels.append(y_batch.detach())
+
+            #DICE loss stats
             train_dice_scores = torch.cat(train_dice_scores, dim=0).to(self.device, dtype=torch.float32)
-
-            train_scan_preds = self._safe_gather(train_scan_preds)
-            train_scan_labels = self._safe_gather(train_scan_labels)
             train_dice_scores = self._safe_gather(train_dice_scores)
-
-            train_preds_np = train_scan_preds.cpu().numpy().astype(int)
-            train_labels_np = train_scan_labels.cpu().numpy().astype(int)
             train_dice_mean = train_dice_scores.cpu().numpy().mean() if train_dice_scores.numel() > 0 else 0.0
+
+            #Classification stats
+            all_preds = torch.cat(all_preds, dim=0).to(self.device, dtype=torch.float32).contiguous()
+            all_labels = torch.cat(all_labels, dim=0).to(self.device, dtype=torch.float32).contiguous()
+            all_preds  = self._safe_gather(all_preds)
+            all_labels = self._safe_gather(all_labels)
+
+            probs = torch.sigmoid(all_preds)
+            train_preds_np = (probs >= 0.5).int().cpu().numpy().ravel()
+            train_labels_np  = all_labels.int().cpu().numpy().ravel()
 
             train_acc = accuracy_score(train_labels_np, train_preds_np)
             train_f1 = f1_score(train_labels_np, train_preds_np, zero_division=0)
@@ -493,23 +530,23 @@ class TrainingPipeline:
             # --- Validation ---
             self.model.eval()
             val_losses = []
-            val_scan_preds, val_scan_labels, val_dice_scores = [], [], []
+            val_dice_scores = []
+            val_preds_list, val_labels_list = [], []
             with torch.no_grad():
-                for x_batch, mask_batch, _ in self.val_loader:
+                for x_batch, mask_batch, y_batch in self.val_loader:
                     x_batch = x_batch.to(self.device, dtype=torch.float16, non_blocking=True)
                     mask_batch = mask_batch.to(self.device, dtype=torch.float16, non_blocking=True)
+                    y_batch = y_batch.float().unsqueeze(1)
+                    y_batch = y_batch.to(self.device, dtype=torch.float16, non_blocking=True)
                     with self.accelerator.autocast():
                         outputs = self.model(x_batch)
-                        loss = self.criterion(outputs, mask_batch)
+                        loss = self.criterion(outputs, (mask_batch, y_batch))
                     val_losses.append(self.accelerator.gather(loss.detach()).mean().item())
 
-                    probs = torch.sigmoid(outputs.detach().to(torch.float32))
+                    #DICE loss
+                    mask_probs = torch.sigmoid(outputs[0].detach().to(torch.float32))
                     targets = mask_batch.detach().to(torch.float32)
-                    pred_masks = (probs >= 0.5).float()
-                    scan_pred = pred_masks.flatten(start_dim=1).any(dim=1).float()
-                    scan_label = targets.flatten(start_dim=1).any(dim=1).float()
-                    val_scan_preds.append(scan_pred)
-                    val_scan_labels.append(scan_label)
+                    pred_masks = (mask_probs >= 0.5).float()
 
                     pred_sum = pred_masks.sum(dim=(1, 2, 3, 4))
                     target_sum = targets.sum(dim=(1, 2, 3, 4))
@@ -517,25 +554,32 @@ class TrainingPipeline:
                     dice = (2.0 * intersection + eps) / (pred_sum + target_sum + eps)
                     val_dice_scores.append(dice)
 
-                    del outputs, loss
+                    #Classification loss
+                    preds = self._safe_gather(outputs[1].detach().to(torch.float32))
+                    labels = self._safe_gather(y_batch.detach().to(torch.float32))
+
+                    # Sigmoid + threshold (done in float32 for numerical stability)
+                    probs = torch.sigmoid(preds)
+                    preds_np = (probs >= 0.5).int().cpu().numpy()
+                    labs_np  = labels.int().cpu().numpy()
+                    val_preds_list.append(preds_np)
+                    val_labels_list.append(labs_np)
+
+                    del preds, labels, probs, preds_np, labs_np, outputs, loss
                     torch.cuda.empty_cache()
 
-            val_scan_preds = torch.cat(val_scan_preds, dim=0).to(self.device, dtype=torch.float32)
-            val_scan_labels = torch.cat(val_scan_labels, dim=0).to(self.device, dtype=torch.float32)
             val_dice_scores = torch.cat(val_dice_scores, dim=0).to(self.device, dtype=torch.float32)
-
-            val_scan_preds = self._safe_gather(val_scan_preds)
-            val_scan_labels = self._safe_gather(val_scan_labels)
             val_dice_scores = self._safe_gather(val_dice_scores)
-
-            val_preds_np = val_scan_preds.cpu().numpy().astype(int)
-            val_labels_np = val_scan_labels.cpu().numpy().astype(int)
             val_dice_mean = val_dice_scores.cpu().numpy().mean() if val_dice_scores.numel() > 0 else 0.0
+
+            val_preds_np = np.concatenate(val_preds_list, axis=0).ravel()
+            val_labels_np = np.concatenate(val_labels_list, axis=0).ravel()
 
             val_acc = accuracy_score(val_labels_np, val_preds_np)
             val_f1 = f1_score(val_labels_np, val_preds_np, zero_division=0)
             val_f2 = fbeta_score(val_labels_np, val_preds_np, beta=2, zero_division=0)
-            history["val_loss"].append(np.mean(val_losses))
+            val_loss = np.mean(val_losses)
+            history["val_loss"].append(val_loss)
             history["val_acc"].append(val_acc)
             history["val_f1"].append(val_f1)
             history["val_f2"].append(val_f2)
@@ -566,13 +610,13 @@ class TrainingPipeline:
             self.accelerator.log(epoch_metrics, step=epoch)
 
             # --- Checkpointing ---
-            if val_acc > best_val_acc:
-                best_val_acc = val_acc
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
                 # unwrap for vanilla state_dict saving
                 unwrapped = self.accelerator.unwrap_model(self.model)
                 # use accelerator.save to be safe in distributed
                 self.accelerator.save(unwrapped.state_dict(), self.checkpoint_path)
-                self.accelerator.print(f"Validation accuracy improved: saved to {self.checkpoint_path}")
+                self.accelerator.print(f"Validation loss improved: saved to {self.checkpoint_path}")
                 epochs_no_improve = 0
             else:
                 epochs_no_improve += 1
