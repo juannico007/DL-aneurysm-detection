@@ -25,6 +25,11 @@
 ## 📢 Relesae v0.0.5 - Preprocessing Update + Sphere Mask Generator
 
 ## 📢 Relesae v0.0.4 - Implement U-net Architecture
+- **Gloo backend:** Replaced NCCL to ensure stable multi-process training across all platforms.  
+- **Safe gather utility:** New tensor-gather function prevents shape mismatches and deadlocks in distributed runs.  
+- **3D U-Net backbone:** Introduced full encoder–decoder architecture, replacing the previous shallow 3D CNN.  
+- **Autocrop for skip connections:** Ensures encoder/decoder shapes match when using "valid" padding or uneven inputs.  
+- **Extended activations & norms:** Added PReLU, RReLU, ELU, GroupNorm, and InstanceNorm for further testing and experimenting options.
 
 ## 📢 Release v0.0.3 - Major Optimization Updat
 - **NumPy compression:** Preprocessing now exports `.npz` files + float16 (1.75× smaller compared to the last version).
