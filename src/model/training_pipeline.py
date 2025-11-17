@@ -26,14 +26,18 @@ class DiceLoss(nn.Module):
         
         #comment out if your model contains a sigmoid or equivalent activation layer
         inputs = F.sigmoid(inputs)       
-        
+        device = inputs.device
+        inputs = inputs.to(device=device, dtype=torch.float32)
+        targets = targets.to(device=device, dtype=torch.float32) 
         #flatten label and prediction tensors
         inputs = inputs.view(-1)
         targets = targets.view(-1)
         
-        intersection = (inputs * targets).sum()                            
-        dice = (2.*intersection + smooth)/(inputs.sum() + targets.sum() + smooth)  
-        
+        intersection = (inputs * targets).sum(dtype=torch.float32)
+        inputs_sum   = inputs.sum(dtype=torch.float32)
+        targets_sum  = targets.sum(dtype=torch.float32)                        
+        dice = (2.*intersection + smooth)/(inputs_sum.sum() + targets_sum.sum() + smooth)  
+        print(dice)
         return 1 - dice
     
 def custom_collate(batch):
