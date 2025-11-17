@@ -107,11 +107,11 @@ def parse_cli_args() -> argparse.Namespace:
 def apply_cli_overrides(cli: argparse.Namespace) -> None:
     os.environ["PULL_ENV_FILE"] = str(cli.env_file)
     mapping = [
-        ("bucket", "PULL_BUCKET"),
+        ("bucket", "S3_BUCKET"),
         ("prefix", "PULL_PREFIX"),
-        ("github_user", "PULL_GITHUB_USER"),
-        ("model_name", "PULL_MODEL_NAME"),
-        ("model_version", "PULL_VERSION"),
+        ("github_user", "GITHUB_USER"),
+        ("model_name", "RUN_MODEL_NAME"),
+        ("model_version", "RUN_MODEL_VERSION"),
         ("output_root", "PULL_OUTPUT_ROOT"),
         ("region", "AWS_REGION"),
         ("aws_access_key_id", "AWS_ACCESS_KEY_ID"),
@@ -283,6 +283,12 @@ def extract_tarball(tar_path: Path, dest: Path) -> Path:
 
 
 def collect_artifacts(model_root: Path, output_root: Path, job_name: str) -> List[Dict]:
+    """
+    Discover metadata.json files inside the extracted SageMaker output tarball and infer where the
+    model/checkpoint files live. Earlier versions of the training metadata did not store explicit
+    "storage" information, so we derive the paths from the metadata location and artifact_id.
+    """
+
     artifacts: List[Dict] = []
     for meta_path in output_root.rglob("metadata.json"):
         try:
@@ -291,18 +297,46 @@ def collect_artifacts(model_root: Path, output_root: Path, job_name: str) -> Lis
         except (json.JSONDecodeError, OSError):
             continue
 
-        storage = metadata.get("storage", {})
         files = metadata.get("files", {})
-        model_subdir = storage.get("model_subdir")
-        output_subdir = storage.get("output_subdir")
-        if not model_subdir or not output_subdir:
+        checkpoint_name = files.get("checkpoint")
+        if not checkpoint_name:
+            continue
+
+        artifact_id = metadata.get("artifact_id")
+        output_base = meta_path.parent
+
+        candidate_model_dirs: List[Path] = []
+        if artifact_id:
+            candidate_model_dirs.append(model_root / artifact_id)
+        try:
+            rel_to_output = output_base.relative_to(output_root)
+        except ValueError:
+            rel_to_output = None
+        if rel_to_output:
+            candidate_model_dirs.append(model_root / rel_to_output)
+        candidate_model_dirs.append(model_root)
+
+        model_base = None
+        for candidate in candidate_model_dirs:
+            if (candidate / checkpoint_name).exists():
+                model_base = candidate
+                break
+
+        if model_base is None:
+            # Fall back to any directory that contains the checkpoint file
+            found = list(model_root.rglob(checkpoint_name))
+            if found:
+                model_base = found[0].parent
+
+        if model_base is None:
+            print(f"[Warning] Could not locate checkpoint '{checkpoint_name}' for metadata at {meta_path}")
             continue
 
         artifacts.append(
             {
                 "metadata": metadata,
-                "model_base": (model_root / model_subdir).resolve(),
-                "output_base": (output_root / output_subdir).resolve(),
+                "model_base": model_base.resolve(),
+                "output_base": output_base.resolve(),
                 "job_name": job_name,
             }
         )
