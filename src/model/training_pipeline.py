@@ -37,7 +37,6 @@ class DiceLoss(nn.Module):
         inputs_sum   = inputs.sum(dtype=torch.float32)
         targets_sum  = targets.sum(dtype=torch.float32)                        
         dice = (2.*intersection + smooth)/(inputs_sum.sum() + targets_sum.sum() + smooth)  
-        print(dice)
         return 1 - dice
     
 def custom_collate(batch):
