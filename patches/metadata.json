@@ -1,0 +1,18 @@
+{
+  "patch_size": 64,
+  "pos_neg_ratio": "1:5",
+  "neg_per_pos_used": 5.0,
+  "radius": 5.0,
+  "margin": 10.0,
+  "center_gap": 4.0,
+  "seed": 13,
+  "min_nonzero_frac": 0.01,
+  "fallback_positives_without_extra_margin": 11,
+  "low_content_rejections": 0,
+  "coords": "center_x/center_y/center_z are patch centers in voxel space; aneurysm_x/y/z are global voxel coords from localizers; aneurysm_rel_* are voxel coords within the patch (origin at patch corner). ",
+  "counts": {
+    "positive": 1042,
+    "negative": 5210,
+    "total": 6252
+  }
+}

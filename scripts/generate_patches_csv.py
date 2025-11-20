@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import h5py
+import numpy as np
 
 
 # Editable hyperparameters (similar to training_pipeline style)
@@ -35,6 +36,7 @@ HYPERPARAMS = {
     "margin": 10.0,
     "center_gap": 4.0,
     "seed": 13,
+    "min_nonzero_frac": 0.01,  # minimum fraction of non-zero voxels required inside a patch
 }
 
 
@@ -96,24 +98,28 @@ def point_to_aabb_sqdist(point: Sequence[float], box_min: Sequence[float], box_m
 
 
 def sample_positive_center(
-    center: Sequence[float],
+    center: Sequence[float], # aneurysm center (z, y, x)
     shape: Sequence[int],
     patch_size: int,
     margin_buffer: float,
     center_gap: float,
     rng: random.Random,
-    max_attempts: int = 50,
+    max_attempts: int = 100,
 ) -> Optional[Tuple[float, float, float]]:
     """
     Sample a patch center so that the aneurysm is inside the patch with a buffer
     and not sitting at the patch center.
     """
+    # clamp center to within volume for robustness (localizers may be slightly outside)
+    center = [max(0.0, min(c, dim - 1)) for c, dim in zip(center, shape)]
     max_starts = [dim - patch_size for dim in shape]
     for _ in range(max_attempts):
         starts = []
         rels = []
         valid = True
+        
         for c, dim, max_start in zip(center, shape, max_starts):
+            # generate a random number relative to patch start
             low = max(0, math.ceil(c - (patch_size - margin_buffer)))
             high = min(max_start, math.floor(c - margin_buffer))
             if low > high:
@@ -166,6 +172,26 @@ def sample_negative_center(
     return None
 
 
+def patch_nonzero_fraction(
+    volume: np.ndarray,
+    center: Sequence[float],
+    patch_size: int,
+    eps: float = 1e-5,
+) -> float:
+    """Compute fraction of voxels above |eps| inside the patch centered at (z,y,x)."""
+    half = patch_size / 2.0
+    start = [
+        int(max(0, min(dim - patch_size, round(c - half))))
+        for c, dim in zip(center, volume.shape)
+    ]
+    z0, y0, x0 = start
+    z1, y1, x1 = z0 + patch_size, y0 + patch_size, x0 + patch_size
+    patch = volume[z0:z1, y0:y1, x0:x1]
+    if patch.size == 0:
+        return 0.0
+    return float(np.count_nonzero(np.abs(patch) > eps) / patch.size)
+
+
 def generate_patches(
     h5_path: Path,
     localizer_csv: Path,
@@ -176,6 +202,7 @@ def generate_patches(
     margin: float = 10.0,
     center_gap: float = 4.0,
     seed: int = 13,
+    min_nonzero_frac: float = 0.01,
 ) -> None:
     rng = random.Random(seed)
     pos_count, neg_count, neg_per_pos = parse_ratio(pos_neg_ratio)
@@ -193,6 +220,8 @@ def generate_patches(
     rows: List[List[str]] = []
     total_pos = 0
     total_neg = 0
+    fallback_positives = 0
+    low_content_rejections = 0
 
     with h5py.File(h5_path, "r") as handle:
         series_group = handle["series"]
@@ -200,26 +229,46 @@ def generate_patches(
             if sid not in series_group:
                 print(f"[Warning] Series {sid} missing in H5, skipping.")
                 continue
-            vol = series_group[sid]["vol"]
-            shape = vol.shape  # (D, H, W)
+            vol_np = np.asarray(series_group[sid]["vol"][:])
+            shape = vol_np.shape  # (D, H, W)
             if any(dim < patch_size for dim in shape):
                 print(f"[Warning] Series {sid} too small for patch size {patch_size}, skipping.")
                 continue
 
             for point in points:
-                aneurysm_z, aneurysm_y, aneurysm_x, aneurysm_loc = point
-                margin_buffer = radius + margin
-                pos_center = sample_positive_center(
-                    center=(aneurysm_z, aneurysm_y, aneurysm_x),
-                    shape=shape,
-                    patch_size=patch_size,
-                    margin_buffer=margin_buffer,
-                    center_gap=center_gap,
-                    rng=rng,
-                )
+                aneurysm_z_raw, aneurysm_y_raw, aneurysm_x_raw, aneurysm_loc = point
+                aneurysm_z = max(0.0, min(aneurysm_z_raw, shape[0] - 1))
+                aneurysm_y = max(0.0, min(aneurysm_y_raw, shape[1] - 1))
+                aneurysm_x = max(0.0, min(aneurysm_x_raw, shape[2] - 1))
+
+                pos_center = None
+                used_margin = radius + margin
+                for margin_buffer in (radius + margin, radius, 0.0):
+                    for _ in range(6):
+                        candidate = sample_positive_center(
+                            center=(aneurysm_z, aneurysm_y, aneurysm_x),
+                            shape=shape,
+                            patch_size=patch_size,
+                            margin_buffer=margin_buffer,
+                            center_gap=center_gap,
+                            rng=rng,
+                        )
+                        if candidate is None:
+                            continue
+                        frac = patch_nonzero_fraction(vol_np, candidate, patch_size)
+                        if frac < min_nonzero_frac:
+                            low_content_rejections += 1
+                            continue
+                        pos_center = candidate
+                        used_margin = margin_buffer
+                        break
+                    if pos_center is not None:
+                        break
                 if pos_center is None:
                     print(f"[Warning] Could not place positive patch for {sid} at {point}.")
                     continue
+                if used_margin < (radius + margin):
+                    fallback_positives += 1
 
                 # Compute aneurysm position in patch coordinates (relative to patch corner)
                 patch_origin = (
@@ -251,14 +300,32 @@ def generate_patches(
                 total_pos += 1
 
                 neg_needed = int(math.ceil(neg_per_pos))
-                for _ in range(neg_needed):
-                    neg_center = sample_negative_center(
-                        shape=shape,
-                        positive_centers=[(aneurysm_z, aneurysm_y, aneurysm_x) for aneurysm_z, aneurysm_y, aneurysm_x, _ in points],
-                        patch_size=patch_size,
-                        exclusion_radius=radius + margin,
-                        rng=rng,
+                pos_centers_for_neg = [
+                    (
+                        max(0.0, min(zp, shape[0] - 1)),
+                        max(0.0, min(yp, shape[1] - 1)),
+                        max(0.0, min(xp, shape[2] - 1)),
                     )
+                    for zp, yp, xp, _ in points
+                ]
+                for _ in range(neg_needed):
+                    neg_center = None
+                    for _ in range(20):
+                        candidate = sample_negative_center(
+                            shape=shape,
+                            positive_centers=pos_centers_for_neg,
+                            patch_size=patch_size,
+                            exclusion_radius=radius + margin,
+                            rng=rng,
+                        )
+                        if candidate is None:
+                            break
+                        frac = patch_nonzero_fraction(vol_np, candidate, patch_size)
+                        if frac < min_nonzero_frac:
+                            low_content_rejections += 1
+                            continue
+                        neg_center = candidate
+                        break
                     if neg_center is None:
                         print(f"[Warning] Could not sample negative patch for {sid}; skipping one.")
                         continue
@@ -300,6 +367,9 @@ def generate_patches(
         "margin": margin,
         "center_gap": center_gap,
         "seed": seed,
+        "min_nonzero_frac": min_nonzero_frac,
+        "fallback_positives_without_extra_margin": fallback_positives,
+        "low_content_rejections": low_content_rejections,
         "coords": (
             "center_x/center_y/center_z are patch centers in voxel space; "
             "aneurysm_x/y/z are global voxel coords from localizers; "
