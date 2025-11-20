@@ -52,6 +52,7 @@ class SegmentationClassificationLoss(nn.Module):
     def __init__(self, segmentation = DiceLoss, classification = nn.BCEWithLogitsLoss, weights=[0.5, 0.5], size_average=True):
         super(SegmentationClassificationLoss, self).__init__()
         self.weights = weights
+        print("weights:", self.weights)
         self.segmentation = segmentation
         self.classification = classification
 
@@ -63,12 +64,14 @@ class SegmentationClassificationLoss(nn.Module):
         classification_target = targets[1]
         classification_input = classification_input.to(device=device, dtype=torch.float32) 
         classification_target = classification_target.to(device=device, dtype=torch.float32) 
-        print("IN LOSS - seg_in.dtype, device, requires_grad:", segmentation_input.dtype, segmentation_input.device, segmentation_input.requires_grad)
-        print("IN LOSS - cls_in.dtype, device, requires_grad:", classification_input.dtype, classification_input.device, classification_input.requires_grad)
+        #print("IN LOSS - seg_in.dtype, device, requires_grad:", segmentation_input.dtype, segmentation_input.device, segmentation_input.requires_grad)
+        #print("IN LOSS - cls_in.dtype, device, requires_grad:", classification_input.dtype, classification_input.device, classification_input.requires_grad)
         
         segmentation_loss = self.segmentation(segmentation_input, segmentation_target)
-        classification_loss = self.classification(classification_input, classification_target)
-        return self.weights[0] * segmentation_loss + self.weights[1] * classification_loss
+        if self.weights[1] != 0:
+            classification_loss = self.classification(classification_input, classification_target)
+            return self.weights[0] * segmentation_loss + self.weights[1] * classification_loss
+        return segmentation_loss
     
 def custom_collate(batch):
     data = [item[0] for item in batch]
@@ -486,7 +489,7 @@ class TrainingPipeline:
                 with self.accelerator.accumulate(self.model):
                     with self.accelerator.autocast():
                         outputs = self.model(x_batch)
-                    #print("Classifier logits min/max:", outputs[1].min(), outputs[1].max())
+                    #print("Classifier logits:", outputs[1].min(), "true label:", y_batch)
                     loss = self.criterion(outputs, (mask_batch, y_batch), self.device)
                     # just before accelerator.backward(loss)
                     #print("LOSS:", loss, "device:", loss.device, "dtype:", loss.dtype, "requires_grad:", loss.requires_grad)

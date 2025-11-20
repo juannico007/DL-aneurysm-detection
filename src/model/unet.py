@@ -381,13 +381,14 @@ class UNet(nn.Module):
             self.down_blocks.append(down_block)
 
         #Auxiliary classifier
-        num_channels = self.start_filters * (2 ** (self.n_blocks-1))
-        self.class_block = ClassifierBlock(in_channels=num_channels, 
-                                           out_neurons=self.class_outputs, 
-                                           middle_neurons=self.middle_neurons,
-                                           drop=self.dropout,
-                                           activation=self.activation)
-        self.class_block.initialize_classifier()
+        if self.middle_neurons:
+            num_channels = self.start_filters * (2 ** (self.n_blocks-1))
+            self.class_block = ClassifierBlock(in_channels=num_channels, 
+                                            out_neurons=self.class_outputs, 
+                                            middle_neurons=self.middle_neurons,
+                                            drop=self.dropout,
+                                            activation=self.activation)
+            self.class_block.initialize_classifier()
 
         # Decoder
         for i in range(n_blocks - 1):
@@ -441,16 +442,22 @@ class UNet(nn.Module):
             x, before_pooling = module(x)
             self.activations += module.activations
             self.encoder_output.append(before_pooling)
-
-        class_output = self.class_block(x)
+            
+        if self.middle_neurons:
+            with torch.autocast(device_type='cuda', enabled=False):
+                class_output = self.class_block(x)
+                self.activations += self.class_block.activations
+        else:
+            class_output = torch.tensor([0], device=x.device)
 
         for i, module in enumerate(self.up_blocks):
             before_pool = self.encoder_output[-(i + 2)]
             x = module(before_pool, x)
             self.activations += module.activations
+        
 
         x = self.final_conv(x)
         self.activations.append(x)
 
-        self.activations += self.class_block.activations
+        
         return x, class_output

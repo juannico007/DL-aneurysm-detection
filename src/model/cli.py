@@ -18,7 +18,7 @@ HYPERPARAMS = {
     "input_shape": (256, 256, 256),
     "batch_size": 1,
     "grad_accum": 2,
-    "epochs": 10,
+    "epochs": 15,
     "learning_rate": 1e-4,
     "weight_decay": 1e-2,
     "scheduler": {
@@ -26,8 +26,9 @@ HYPERPARAMS = {
         "step_size": 100,
         "gamma": 0.96,
     },
-    "proportion_to_use": 0.1,
+    "proportion_to_use": 0.5,
     "max_voxels": 128 * 256 * 256,
+    "weights": [0.999,0.001],
     # "scheduler":{
     #     "name" : "cosine",
     #     "eta_min": 1e-6
@@ -59,7 +60,7 @@ HYPERPARAMS = {
         "up_mode": "transposed",
         "middle_neurons": 256,
         "class_output": 1,
-        "dropout": 0
+        "dropout": 0,
     },
 }
 
@@ -246,6 +247,7 @@ def main():
         radius=hyperparams["radius"],
         localizer_csv=hyperparams.get("localizer_csv"),
         scheduler_config=hyperparams["scheduler"],
+        weights=hyperparams["weights"]
     )
 
     print("\n[4/5] Creating Pytorch dataloaders...")
