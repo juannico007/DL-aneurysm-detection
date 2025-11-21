@@ -6,19 +6,19 @@ import os
 import torch.distributed as dist
 import json
 from datetime import datetime
-
+import numpy as np
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 
 MODE_ENV_VAR = "TRAINING_MODE"
 
 HYPERPARAMS = {
-    "data_dir": "h5-aneurysm",
-    "csv_path": "train.csv",
-    "localizer_csv": "train_localizers.csv",
+    "data_dir": "h5-aneurysm.h5",
+    "patch_csv": "patches/patches.csv",
+    "proportion_to_use": 1.0,
     "input_shape": (256, 256, 256),
-    "batch_size": 1,
+    "batch_size": 20,
     "grad_accum": 2,
-    "epochs": 15,
+    "epochs": 30,
     "learning_rate": 1e-4,
     "weight_decay": 1e-2,
     "scheduler": {
@@ -26,8 +26,8 @@ HYPERPARAMS = {
         "step_size": 100,
         "gamma": 0.96,
     },
-    "proportion_to_use": 0.5,
-    "max_voxels": 128 * 256 * 256,
+    "proportion_to_use": 1.0,
+    "max_voxels": 500 * 500 * 500,
     "weights": [0.999,0.001],
     # "scheduler":{
     #     "name" : "cosine",
@@ -137,9 +137,8 @@ def main():
 
     # Heavy imports AFTER deps are ensured
 
-    from .data_loader import ScanDataLoader
     from .unet import UNet
-    from .training_pipeline import TrainingPipeline
+    from .training_pipeline import TrainingPipeline, load_patch_records
 
     input_shape = tuple(hyperparams["input_shape"])
 
@@ -211,16 +210,35 @@ def main():
         return Path(".") / preferred
 
     h5_path = resolve_h5_path(Path(hyperparams["data_dir"]))
+    patch_csv = Path(hyperparams["patch_csv"])
+    proportion = float(hyperparams.get("proportion_to_use", 1.0))
+    split_seed = int(hyperparams.get("split_seed", 42))
 
-    print("\n[1/5] Loading dataset...")
-    data_loader = ScanDataLoader(
-        h5_path=h5_path,
-        csv_path=Path(hyperparams["csv_path"]),
-        proportion_to_use=hyperparams["proportion_to_use"] if "proportion_to_use" in hyperparams else 1.0,
-        max_voxels=hyperparams.get("max_voxels"),
-    )
-    resolved_h5_path = Path(data_loader.h5_path)
-    x_train, y_train, x_val, y_val = data_loader.split_data(train_ratio=hyperparams["train_ratio"])
+    print("\n[1/5] Loading patch metadata...")
+    records = load_patch_records(patch_csv)
+    if not records:
+        raise ValueError(f"No records found in {patch_csv}")
+
+    # patient-level subsampling by proportion_to_use
+    series_ids = sorted({r.series_id for r in records})
+    if not (0 < proportion <= 1):
+        raise ValueError("proportion_to_use must be in (0,1].")
+    if proportion < 1.0:
+        rng = np.random.default_rng(split_seed)
+        keep_count = max(1, int(round(len(series_ids) * proportion)))
+        keep_series = set(rng.choice(series_ids, size=keep_count, replace=False))
+        records = [r for r in records if r.series_id in keep_series]
+        print(f"[Info] Using {keep_count}/{len(series_ids)} series (~{proportion*100:.1f}%).")
+    else:
+        keep_series = set(series_ids)
+
+    # report counts
+    pos_count = sum(1 for r in records if r.label == 1)
+    neg_count = sum(1 for r in records if r.label == 0)
+    print(f"[Info] Patch counts -> positives: {pos_count}, negatives: {neg_count}, total: {len(records)}")
+    print(f"[Info] Series covered: {len({r.series_id for r in records})}")
+
+    resolved_h5_path = Path(h5_path)
 
     print("\n[2/5] Building model...")
 
@@ -245,7 +263,10 @@ def main():
         grad_accum_steps=hyperparams["grad_accum"],
         checkpoint_path=str(checkpoint_path),
         radius=hyperparams["radius"],
-        localizer_csv=hyperparams.get("localizer_csv"),
+        patch_csv=patch_csv,
+        patch_size=hyperparams.get("patch_size", 64),
+        train_ratio=hyperparams.get("train_ratio", 0.8),
+        split_seed=hyperparams.get("split_seed", 42),
         scheduler_config=hyperparams["scheduler"],
         weights=hyperparams["weights"]
     )
@@ -253,10 +274,10 @@ def main():
     print("\n[4/5] Creating Pytorch dataloaders...")
     train_dataset, val_dataset = pipeline.create_dataloaders(
         h5_path=resolved_h5_path,
-        x_train=x_train,
-        y_train=y_train,
-        x_val=x_val,
-        y_val=y_val
+        patch_csv=patch_csv,
+        train_ratio=hyperparams.get("train_ratio", 0.8),
+        split_seed=hyperparams.get("split_seed", 42),
+        records=records,
     )
 
     print("\n[5/5] Training model...")

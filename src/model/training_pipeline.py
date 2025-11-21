@@ -1,7 +1,6 @@
 from torch.nn import utils
 from .unet import UNet
 from .data_augmentation import DataAugmentation, rotate_batch_gpu
-from sklearn.metrics import accuracy_score, f1_score, fbeta_score
 from torch.utils.data import Dataset, DataLoader
 import torch.optim as optim
 import torch.nn as nn
@@ -15,7 +14,8 @@ import bitsandbytes as bnb
 from pathlib import Path
 from accelerate import Accelerator
 import pandas as pd
-
+import csv
+from dataclasses import dataclass
 import h5py
 
 class DiceLoss(nn.Module):
@@ -121,6 +121,22 @@ def make_sphere_mask(shape, center, radius=5.0):
     mask = dist <= radius**2
     return mask.astype(np.uint8)
 
+
+@dataclass
+class PatchRecord:
+    series_id: str
+    center_z: float
+    center_y: float
+    center_x: float
+    label: int
+    aneurysm_x: Optional[float] = None
+    aneurysm_y: Optional[float] = None
+    aneurysm_z: Optional[float] = None
+    aneurysm_rel_x: Optional[float] = None
+    aneurysm_rel_y: Optional[float] = None
+    aneurysm_rel_z: Optional[float] = None
+    location: str = "background"
+
 class AneurysmDataset(Dataset):
     """Lightweight dataset that fetches volumes (and optional masks) from HDF5 on demand."""
 
@@ -209,6 +225,128 @@ class AneurysmDataset(Dataset):
         label = self.labels[idx]
         return volume, mask, label
 
+
+def _safe_float(value: str) -> Optional[float]:
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def load_patch_records(patch_csv: Path) -> List[PatchRecord]:
+    """Load patch metadata from CSV into PatchRecord objects."""
+    records: List[PatchRecord] = []
+    with patch_csv.open() as f:
+        reader = csv.DictReader(f)
+        required = {"series_id", "center_x", "center_y", "center_z", "label"}
+        missing = required.difference(reader.fieldnames or set())
+        if missing:
+            raise ValueError(f"Patches CSV missing columns: {', '.join(sorted(missing))}")
+        for row in reader:
+            label = int(row["label"])
+            records.append(
+                PatchRecord(
+                    series_id=row["series_id"],
+                    center_z=float(row["center_z"]),
+                    center_y=float(row["center_y"]),
+                    center_x=float(row["center_x"]),
+                    label=label,
+                    aneurysm_x=_safe_float(row.get("aneurysm_x")),
+                    aneurysm_y=_safe_float(row.get("aneurysm_y")),
+                    aneurysm_z=_safe_float(row.get("aneurysm_z")),
+                    aneurysm_rel_x=_safe_float(row.get("aneurysm_rel_x")),
+                    aneurysm_rel_y=_safe_float(row.get("aneurysm_rel_y")),
+                    aneurysm_rel_z=_safe_float(row.get("aneurysm_rel_z")),
+                    location=row.get("location", "background") or "background",
+                )
+            )
+    return records
+
+
+class PatchAneurysmDataset(Dataset):
+    """Dataset that fetches fixed-size patches from HDF5 using patches.csv metadata."""
+
+    def __init__(
+        self,
+        h5_path: Path,
+        records: List[PatchRecord],
+        patch_size: int,
+        transform=None,
+        radius: float = 5.0,
+    ):
+        self.h5_path = str(h5_path)
+        self.records = records
+        self.patch_size = patch_size
+        self.transform = transform
+        self.radius = radius
+        self._h5 = None
+
+    def __len__(self):
+        return len(self.records)
+
+    def _get_file(self):
+        if self._h5 is None:
+            self._h5 = h5py.File(self.h5_path, "r")
+        return self._h5
+
+    def close(self):
+        if self._h5 is not None:
+            self._h5.close()
+            self._h5 = None
+
+    def __del__(self):
+        self.close()
+
+    def _crop_patch(self, vol_ds, center: Tuple[float, float, float]) -> Tuple[np.ndarray, Tuple[int, int, int]]:
+        half = self.patch_size / 2.0
+        starts = [
+            int(max(0, min(vol_ds.shape[i] - self.patch_size, round(center[i] - half))))
+            for i in range(3)
+        ]
+        z0, y0, x0 = starts
+        z1, y1, x1 = z0 + self.patch_size, y0 + self.patch_size, x0 + self.patch_size
+        patch = vol_ds[z0:z1, y0:y1, x0:x1]
+        return patch, (z0, y0, x0)
+
+    def __getitem__(self, idx):
+        record = self.records[idx]
+        handle = self._get_file()
+        vol_ds = handle["series"][record.series_id]["vol"]
+        patch_np, (z0, y0, x0) = self._crop_patch(vol_ds, (record.center_z, record.center_y, record.center_x))
+
+        if patch_np.shape != (self.patch_size, self.patch_size, self.patch_size):
+            # pad if at boundary
+            pad_z = self.patch_size - patch_np.shape[0]
+            pad_y = self.patch_size - patch_np.shape[1]
+            pad_x = self.patch_size - patch_np.shape[2]
+            patch_np = np.pad(patch_np, ((0, pad_z), (0, pad_y), (0, pad_x)), mode="constant")
+
+        mask_np = np.zeros_like(patch_np, dtype=np.uint8)
+        if record.label == 1:
+            if record.aneurysm_rel_x is not None and record.aneurysm_rel_y is not None and record.aneurysm_rel_z is not None:
+                center = (record.aneurysm_rel_z, record.aneurysm_rel_y, record.aneurysm_rel_x)
+            elif record.aneurysm_x is not None and record.aneurysm_y is not None and record.aneurysm_z is not None:
+                center = (
+                    record.aneurysm_z - z0,
+                    record.aneurysm_y - y0,
+                    record.aneurysm_x - x0,
+                )
+            else:
+                center = (self.patch_size / 2.0, self.patch_size / 2.0, self.patch_size / 2.0)
+            mask_np = make_sphere_mask(patch_np.shape, center, radius=self.radius)
+
+        volume = torch.from_numpy(patch_np)
+        mask = torch.from_numpy(mask_np).unsqueeze(0)
+
+        if self.transform:
+            volume = self.transform(volume)
+        elif volume.ndim == 3:
+            volume = volume.unsqueeze(0)
+
+        return volume, mask, record.label
+
 class TrainingPipeline:
     """Training pipeline for the aneurysm detection model."""
     
@@ -227,9 +365,12 @@ class TrainingPipeline:
         mixed_precision: str = "fp16",
         grad_accum_steps: int = 2,
         radius: float = 5.0,
-        localizer_csv: Optional[Path] = None,
+        patch_csv: Optional[Path] = None,
+        patch_size: int = 64,
+        train_ratio: float = 0.8,
+        split_seed: int = 42,
         scheduler_config: Optional[Dict[str, Any]] = None,
-        weights : list = [0.5,0.5]
+        weights : list = [0.5,0.5],
     ):
         """
         Initialize training pipeline.
@@ -258,7 +399,10 @@ class TrainingPipeline:
         self.min_lr = min_lr
         self.checkpoint_path = checkpoint_path
         self.radius = radius
-        self.localizer_csv = Path(localizer_csv) if localizer_csv else None
+        self.patch_csv = Path(patch_csv) if patch_csv else None
+        self.patch_size = patch_size
+        self.train_ratio = train_ratio
+        self.split_seed = split_seed
         self.scheduler_config = dict(scheduler_config) if scheduler_config else {
             "name": "step",
             "step_size": 100,
@@ -278,62 +422,80 @@ class TrainingPipeline:
     def create_dataloaders(
         self,
         h5_path: Path,
-        x_train: np.ndarray,
-        y_train: np.ndarray,
-        x_val: np.ndarray,
-        y_val: np.ndarray
+        patch_csv: Path,
+        train_ratio: Optional[float] = None,
+        split_seed: Optional[int] = None,
+        records: Optional[List[PatchRecord]] = None,
     ) -> Tuple[DataLoader, DataLoader]:
         """
-        Create pytorch DataLoaders.
-        
-        Parameters
-        ----------
-            x_train: Training volumes
-            y_train: Training labels
-            x_val: Validation volumes
-            y_val: Validation labels
-            
-        Returns
-        ----------
-            Tuple of (train_dataset, val_dataset)
+        Create PyTorch DataLoaders from patch metadata.
         """
+        if patch_csv is None and records is None and self.patch_csv is None:
+            raise ValueError("patch_csv or records must be provided for patch-based training.")
+        patch_csv = patch_csv or self.patch_csv
+        train_ratio = train_ratio if train_ratio is not None else self.train_ratio
+        split_seed = split_seed if split_seed is not None else self.split_seed
+
+        if records is None:
+            records = load_patch_records(Path(patch_csv))
+        if not records:
+            raise ValueError(f"No patch records found in {patch_csv}")
+
+        rng = np.random.default_rng(split_seed)
+        indices = np.arange(len(records))
+        rng.shuffle(indices)
+        cutoff = int(train_ratio * len(indices))
+        train_idx = indices[:cutoff]
+        val_idx = indices[cutoff:]
+
+        train_records = [records[i] for i in train_idx]
+        val_records = [records[i] for i in val_idx]
+
+        train_labels = np.array([r.label for r in train_records], dtype=int)
+        pos = train_labels.sum()
+        neg = len(train_labels) - pos
+        if pos == 0:
+            pos_weight = torch.tensor(1.0)
+        else:
+            pos_weight = torch.tensor(neg / max(pos, 1), dtype=torch.float32)
+        self.pos_weight = pos_weight
+
         train_transforms = transforms.Compose([
             DataAugmentation.augment_training
         ])
-        train_dataset = AneurysmDataset(
-            h5_path=h5_path,
-            series_ids=x_train,
-            labels=y_train,
-            transform=train_transforms,
-            localizer_csv=self.localizer_csv,
-            radius=self.radius,
-        )
-        train_loader = DataLoader(
-            train_dataset,
-            batch_size=self.batch_size,
-            shuffle=True,          # same as tf shuffle
-            num_workers=0,         # similar to tf AUTOTUNE parallel calls
-            pin_memory=True,        # speeds up transfer to GPU
-            collate_fn=pad_collate_3d,
-        )
-        
         val_transforms = transforms.Compose([
             DataAugmentation.prepare_validation
         ])
-        val_dataset = AneurysmDataset(
+
+        train_dataset = PatchAneurysmDataset(
             h5_path=h5_path,
-            series_ids=x_val,
-            labels=y_val,
-            transform=val_transforms,
-            localizer_csv=self.localizer_csv,
+            records=train_records,
+            patch_size=self.patch_size,
+            transform=train_transforms,
             radius=self.radius,
+        )
+        val_dataset = PatchAneurysmDataset(
+            h5_path=h5_path,
+            records=val_records,
+            patch_size=self.patch_size,
+            transform=val_transforms,
+            radius=self.radius,
+        )
+
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=self.batch_size,
+            shuffle=True,
+            num_workers=0,
+            pin_memory=True,
+            collate_fn=pad_collate_3d,
         )
         val_loader = DataLoader(
             val_dataset,
             batch_size=self.batch_size,
-            shuffle=True,          # same as tf shuffle
-            num_workers=0,         # similar to tf AUTOTUNE parallel calls
-            pin_memory=True,        # speeds up transfer to GPU
+            shuffle=True,
+            num_workers=0,
+            pin_memory=True,
             collate_fn=pad_collate_3d,
         )
         self.train_loader, self.val_loader = self.accelerator.prepare(train_loader, val_loader)
@@ -455,7 +617,9 @@ class TrainingPipeline:
             eps=1e-8,
             weight_decay=self.weight_decay)
         self.segmentation_loss = DiceLoss()
-        self.classification_loss = nn.BCEWithLogitsLoss()
+        cls_pos_weight = getattr(self, "pos_weight", torch.tensor(1.0))
+        cls_pos_weight = cls_pos_weight.to(self.device)
+        self.classification_loss = nn.BCEWithLogitsLoss(pos_weight=cls_pos_weight)
         self.criterion = SegmentationClassificationLoss(self.segmentation_loss, self.classification_loss, weights=self.weights)
         self.model, self.optimizer = self.accelerator.prepare(self.model, self.optimizer)
         self._configure_scheduler()
@@ -467,8 +631,8 @@ class TrainingPipeline:
 
         #Also we want to keep track of our training history
         history = {
-            "train_loss": [], "train_acc": [], "train_f1": [], "train_f2": [],
-            "val_loss": [], "val_acc": [], "val_f1": [], "val_f2": [],
+            "train_loss": [], "train_acc": [], "train_sensitivity": [], "train_ppv": [], "train_npv": [],
+            "val_loss": [], "val_acc": [], "val_sensitivity": [], "val_ppv": [], "val_npv": [],
             "train_dice": [], "val_dice": []
         }
 
@@ -541,14 +705,20 @@ class TrainingPipeline:
             train_preds_np = (probs >= 0.5).int().cpu().numpy().ravel()
             train_labels_np  = all_labels.int().cpu().numpy().ravel()
 
-            train_acc = accuracy_score(train_labels_np, train_preds_np)
-            train_f1 = f1_score(train_labels_np, train_preds_np, zero_division=0)
-            train_f2 = fbeta_score(train_labels_np, train_preds_np, beta=2, zero_division=0)
+            tp = np.logical_and(train_preds_np == 1, train_labels_np == 1).sum()
+            tn = np.logical_and(train_preds_np == 0, train_labels_np == 0).sum()
+            fp = np.logical_and(train_preds_np == 1, train_labels_np == 0).sum()
+            fn = np.logical_and(train_preds_np == 0, train_labels_np == 1).sum()
+            train_acc = (tp + tn) / max(len(train_labels_np), 1)
+            train_sens = tp / max(tp + fn, 1)  # sensitivity/recall
+            train_ppv = tp / max(tp + fp, 1)   # precision/PPV
+            train_npv = tn / max(tn + fn, 1)   # NPV
 
             history["train_loss"].append(np.mean(train_losses))
             history["train_acc"].append(train_acc)
-            history["train_f1"].append(train_f1)
-            history["train_f2"].append(train_f2)
+            history["train_sensitivity"].append(train_sens)
+            history["train_ppv"].append(train_ppv)
+            history["train_npv"].append(train_npv)
             history["train_dice"].append(train_dice_mean)
 
             # --- Validation ---
@@ -599,34 +769,42 @@ class TrainingPipeline:
             val_preds_np = np.concatenate(val_preds_list, axis=0).ravel()
             val_labels_np = np.concatenate(val_labels_list, axis=0).ravel()
 
-            val_acc = accuracy_score(val_labels_np, val_preds_np)
-            val_f1 = f1_score(val_labels_np, val_preds_np, zero_division=0)
-            val_f2 = fbeta_score(val_labels_np, val_preds_np, beta=2, zero_division=0)
+            tp = np.logical_and(val_preds_np == 1, val_labels_np == 1).sum()
+            tn = np.logical_and(val_preds_np == 0, val_labels_np == 0).sum()
+            fp = np.logical_and(val_preds_np == 1, val_labels_np == 0).sum()
+            fn = np.logical_and(val_preds_np == 0, val_labels_np == 1).sum()
+            val_acc = (tp + tn) / max(len(val_labels_np), 1)
+            val_sens = tp / max(tp + fn, 1)
+            val_ppv = tp / max(tp + fp, 1)
+            val_npv = tn / max(tn + fn, 1)
             val_loss = np.mean(val_losses)
             history["val_loss"].append(val_loss)
             history["val_acc"].append(val_acc)
-            history["val_f1"].append(val_f1)
-            history["val_f2"].append(val_f2)
+            history["val_sensitivity"].append(val_sens)
+            history["val_ppv"].append(val_ppv)
+            history["val_npv"].append(val_npv)
             history["val_dice"].append(val_dice_mean)
 
             self.accelerator.print(
                 f"Epoch {epoch}/{self.epochs} | "
                 f"Train Loss: {history['train_loss'][-1]:.4f} | Acc: {train_acc:.4f} | "
-                f"F1: {train_f1:.4f} | F2: {train_f2:.4f} | Dice: {history['train_dice'][-1]:.4f} | "
+                f"Sens: {train_sens:.4f} | PPV: {train_ppv:.4f} | NPV: {train_npv:.4f} | Dice: {history['train_dice'][-1]:.4f} | "
                 f"Val Loss: {history['val_loss'][-1]:.4f} | Acc: {val_acc:.4f} | "
-                f"F1: {val_f1:.4f} | F2: {val_f2:.4f} | Dice: {history['val_dice'][-1]:.4f}"
+                f"Sens: {val_sens:.4f} | PPV: {val_ppv:.4f} | NPV: {val_npv:.4f} | Dice: {history['val_dice'][-1]:.4f}"
             )
 
             epoch_metrics = {
                 "train/loss": history["train_loss"][-1],
                 "train/acc": train_acc,
-                "train/f1": train_f1,
-                "train/f2": train_f2,
+                "train/sensitivity": train_sens,
+                "train/ppv": train_ppv,
+                "train/npv": train_npv,
                 "train/dice": history["train_dice"][-1],
                 "val/loss": history["val_loss"][-1],
                 "val/acc": val_acc,
-                "val/f1": val_f1,
-                "val/f2": val_f2,
+                "val/sensitivity": val_sens,
+                "val/ppv": val_ppv,
+                "val/npv": val_npv,
                 "val/dice": history["val_dice"][-1],
                 "lr": self.optimizer.param_groups[0]["lr"],
                 "epoch": epoch,
