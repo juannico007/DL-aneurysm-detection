@@ -12,35 +12,37 @@ os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 MODE_ENV_VAR = "TRAINING_MODE"
 
 HYPERPARAMS = {
-    "data_dir": "h5-aneurysm.h5",
+    "data_dir": "train_dataset.h5",
     "patch_csv": "patches/patches.csv",
     "proportion_to_use": 1.0,
     "input_shape": (256, 256, 256),
     "batch_size": 20,
     "grad_accum": 2,
-    "epochs": 30,
+    "epochs": 24,
     "learning_rate": 1e-4,
     "weight_decay": 1e-2,
-    "scheduler": {
-        "name": "step",
-        "step_size": 100,
-        "gamma": 0.96,
-    },
+    # "scheduler": {
+    #     "name": "step",
+    #     "step_size": 100,
+    #     "gamma": 0.96,
+    # },
     "proportion_to_use": 1.0,
     "max_voxels": 500 * 500 * 500,
-    "weights": [0.999,0.001],
+    "weights": [0.7,0.3],
+    "heatmap_sigma": 15,
+    "heatmap_decay_epoch": 20,
     # "scheduler":{
     #     "name" : "cosine",
     #     "eta_min": 1e-6
     # },
 
-    # "scheduler": {
-    #     "name": "plateau",
-    #     "mode": "min",
-    #     "factor": 0.5,
-    #     "patience": 10,
-    #     "min_lr": 1e-6,
-    # },
+    "scheduler": {
+        "name": "plateau",
+        "mode": "min",
+        "factor": 0.5,
+        "patience": 10,
+        "min_lr": 1e-6,
+    },
 
     # "scheduler": {
     #     "name": "onecycle",
@@ -264,6 +266,8 @@ def main():
         checkpoint_path=str(checkpoint_path),
         radius=hyperparams["radius"],
         patch_csv=patch_csv,
+        heatmap_sigma=hyperparams["heatmap_sigma"],
+        heatmap_decay_epoch=hyperparams.get("heatmap_decay_epoch", 0),
         patch_size=hyperparams.get("patch_size", 64),
         train_ratio=hyperparams.get("train_ratio", 0.8),
         split_seed=hyperparams.get("split_seed", 42),

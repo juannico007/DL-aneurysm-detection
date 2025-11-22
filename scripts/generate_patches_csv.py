@@ -27,7 +27,7 @@ import numpy as np
 
 # Editable hyperparameters (similar to training_pipeline style)
 HYPERPARAMS = {
-    "h5": Path("h5-aneurysm.h5"),
+    "h5": Path("train_dataset.h5"),
     "localizers": Path("train_localizers.csv"),
     "output_dir": Path("patches"),
     "patch_size": 64,

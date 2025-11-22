@@ -38,6 +38,36 @@ class DiceLoss(nn.Module):
         targets_sum  = targets.sum(dtype=torch.float32)                        
         dice = (2.*intersection + smooth)/(inputs_sum.sum() + targets_sum.sum() + smooth)  
         return 1 - dice
+
+class DiceSemimetricLoss(nn.Module):
+    """
+    JML2-style Dice semimetric loss that supports soft labels.
+    For hard labels this matches classic soft Dice; for soft labels it keeps the optimum at x=y.
+    """
+    def __init__(self, eps: float = 1e-6, clip_threshold: float = 0.0, sharp_power: float = 1.0):
+        super().__init__()
+        self.eps = eps
+        self.clip_threshold = clip_threshold
+        self.sharp_power = sharp_power
+
+    def forward(self, inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        # inputs: logits, targets: soft labels
+        probs = torch.sigmoid(inputs)
+        probs = probs.to(dtype=torch.float32)
+        targets = targets.to(dtype=torch.float32)
+        # Sharpen the target to downweight tails of the Gaussian and focus on the center.
+        targets = targets.pow(self.sharp_power)
+        if self.clip_threshold > 0:
+            targets = torch.where(targets >= self.clip_threshold, targets, torch.zeros_like(targets))
+
+        # If we predict single-channel but have multi-heatmap targets, broadcast
+        if probs.shape[1] == 1 and targets.shape[1] > 1:
+            probs = probs.expand(-1, targets.shape[1], -1, -1, -1)
+
+        intersection = (probs * targets).sum(dim=(2, 3, 4))
+        sym_diff = (probs - targets).abs().sum(dim=(2, 3, 4))
+        loss = 1.0 - (intersection + self.eps) / (intersection + sym_diff + self.eps)
+        return loss.mean()
     
 class SegmentationClassificationLoss(nn.Module):
     """
@@ -67,11 +97,15 @@ class SegmentationClassificationLoss(nn.Module):
         #print("IN LOSS - seg_in.dtype, device, requires_grad:", segmentation_input.dtype, segmentation_input.device, segmentation_input.requires_grad)
         #print("IN LOSS - cls_in.dtype, device, requires_grad:", classification_input.dtype, classification_input.device, classification_input.requires_grad)
         
-        segmentation_loss = self.segmentation(segmentation_input, segmentation_target)
+        segmentation_loss = self._segmentation_loss(segmentation_input, segmentation_target)
         if self.weights[1] != 0:
             classification_loss = self.classification(classification_input, classification_target)
             return self.weights[0] * segmentation_loss + self.weights[1] * classification_loss
         return segmentation_loss
+
+    def _segmentation_loss(self, inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        """Compute segmentation loss using the provided segmentation criterion (supports soft labels)."""
+        return self.segmentation(inputs, targets)
     
 def custom_collate(batch):
     data = [item[0] for item in batch]
@@ -121,6 +155,25 @@ def make_sphere_mask(shape, center, radius=5.0):
     mask = dist <= radius**2
     return mask.astype(np.uint8)
 
+def _gaussian_heatmap(shape: Tuple[int, int, int], center: Tuple[float, float, float], sigma: float) -> np.ndarray:
+    """Create a single 3D Gaussian heatmap with peak 1.0."""
+    z, y, x = np.ogrid[:shape[0], :shape[1], :shape[2]]
+    cz, cy, cx = center
+    dist2 = np.square(x - cx)+ np.square(y - cy) + np.square(z - cz)
+    heatmap = np.exp(-dist2 / (2.0 * sigma ** 2))
+    peak = heatmap.max()
+    if peak > 0:
+        heatmap = heatmap / peak
+    return heatmap.astype(np.float32)
+
+
+def make_heatmaps(shape: Tuple[int, int, int], center: Tuple[float, float, float], sigmas: Sequence[float]) -> np.ndarray:
+    """Return stacked 3D Gaussian heatmaps for each sigma."""
+    if not sigmas:
+        return np.zeros((1,) + tuple(shape), dtype=np.float32)
+    heatmaps = [_gaussian_heatmap(shape, center, sigma) for sigma in sigmas]
+    return np.stack(heatmaps, axis=0)
+
 
 @dataclass
 class PatchRecord:
@@ -148,12 +201,14 @@ class AneurysmDataset(Dataset):
         transform=None,
         localizer_csv: Optional[Path] = None,
         radius: float = 5.0,
+        heatmap_sizes: Sequence[float] = (15.0,),
     ):
         self.h5_path = str(h5_path)
         self.series_ids = list(series_ids)
         self.labels = [int(label) for label in labels]
         self.transform = transform
         self.radius = radius
+        self.heatmap_sizes = list(heatmap_sizes) if heatmap_sizes else [radius]
         self.localizer_points = self._load_localizer_points(localizer_csv)
         self._h5 = None
 
@@ -195,16 +250,17 @@ class AneurysmDataset(Dataset):
         return grouped
 
     def _build_mask(self, pid: str, shape: Tuple[int, int, int]) -> torch.Tensor:
-        mask_np = np.zeros(shape, dtype=np.uint8)
+        mask_np = np.zeros((len(self.heatmap_sizes),) + shape, dtype=np.float32)
         centers = self.localizer_points.get(str(pid))
         if centers is not None:
             for center in centers:
-                mask_np |= make_sphere_mask(shape, center, radius=self.radius)
-        return torch.from_numpy(mask_np).unsqueeze(0)
+                heatmaps = make_heatmaps(shape, center, sigmas=self.heatmap_sizes)
+                mask_np = np.maximum(mask_np, heatmaps)
+        return torch.from_numpy(mask_np)
 
     @staticmethod
-    def _empty_mask(shape: Tuple[int, int, int]) -> torch.Tensor:
-        return torch.zeros((1,) + tuple(shape), dtype=torch.uint8)
+    def _empty_mask(shape: Tuple[int, int, int], channels: int = 1) -> torch.Tensor:
+        return torch.zeros((channels,) + tuple(shape), dtype=torch.float32)
 
     def __getitem__(self, idx):
         handle = self._get_file()
@@ -215,7 +271,7 @@ class AneurysmDataset(Dataset):
         if centers is not None and len(centers):
             mask = self._build_mask(pid, volume.shape[-3:])
         else:
-            mask = self._empty_mask(volume.shape[-3:])
+            mask = self._empty_mask(volume.shape[-3:], channels=len(self.heatmap_sizes))
 
         if self.transform:
             volume = self.transform(volume)
@@ -275,12 +331,14 @@ class PatchAneurysmDataset(Dataset):
         patch_size: int,
         transform=None,
         radius: float = 5.0,
+        heatmap_sizes: Sequence[float] = (15.0,),
     ):
         self.h5_path = str(h5_path)
         self.records = records
         self.patch_size = patch_size
         self.transform = transform
         self.radius = radius
+        self.heatmap_sizes = list(heatmap_sizes) if heatmap_sizes else [radius]
         self._h5 = None
 
     def __len__(self):
@@ -323,7 +381,7 @@ class PatchAneurysmDataset(Dataset):
             pad_x = self.patch_size - patch_np.shape[2]
             patch_np = np.pad(patch_np, ((0, pad_z), (0, pad_y), (0, pad_x)), mode="constant")
 
-        mask_np = np.zeros_like(patch_np, dtype=np.uint8)
+        mask_np = np.zeros((len(self.heatmap_sizes),) + patch_np.shape, dtype=np.float32)
         if record.label == 1:
             if record.aneurysm_rel_x is not None and record.aneurysm_rel_y is not None and record.aneurysm_rel_z is not None:
                 center = (record.aneurysm_rel_z, record.aneurysm_rel_y, record.aneurysm_rel_x)
@@ -335,10 +393,10 @@ class PatchAneurysmDataset(Dataset):
                 )
             else:
                 center = (self.patch_size / 2.0, self.patch_size / 2.0, self.patch_size / 2.0)
-            mask_np = make_sphere_mask(patch_np.shape, center, radius=self.radius)
+            mask_np = make_heatmaps(patch_np.shape, center, sigmas=self.heatmap_sizes)
 
         volume = torch.from_numpy(patch_np)
-        mask = torch.from_numpy(mask_np).unsqueeze(0)
+        mask = torch.from_numpy(mask_np)
 
         if self.transform:
             volume = self.transform(volume)
@@ -365,6 +423,8 @@ class TrainingPipeline:
         mixed_precision: str = "fp16",
         grad_accum_steps: int = 2,
         radius: float = 5.0,
+        heatmap_sigma: float = 15.0,
+        heatmap_decay_epoch: int = 0,
         patch_csv: Optional[Path] = None,
         patch_size: int = 64,
         train_ratio: float = 0.8,
@@ -399,6 +459,12 @@ class TrainingPipeline:
         self.min_lr = min_lr
         self.checkpoint_path = checkpoint_path
         self.radius = radius
+        self.initial_heatmap_sigma = float(heatmap_sigma)
+        self.current_heatmap_sigma = float(heatmap_sigma)
+        self.heatmap_min_sigma = 5.0
+        self.heatmap_decay_epoch = int(heatmap_decay_epoch)
+        self.heatmap_sizes = [self.current_heatmap_sigma]
+        self.primary_heatmap_index = 0
         self.patch_csv = Path(patch_csv) if patch_csv else None
         self.patch_size = patch_size
         self.train_ratio = train_ratio
@@ -418,7 +484,32 @@ class TrainingPipeline:
             mixed_precision=mixed_precision, 
             gradient_accumulation_steps=grad_accum_steps
         )
-    
+
+    def _set_heatmap_sigma(self, sigma: float):
+        """Update heatmap sigma (clamped to minimum) across datasets."""
+        self.current_heatmap_sigma = max(self.heatmap_min_sigma, float(sigma))
+        self.heatmap_sizes = [self.current_heatmap_sigma]
+        if hasattr(self, "train_loader") and hasattr(self.train_loader, "dataset"):
+            self.train_loader.dataset.heatmap_sizes = self.heatmap_sizes
+        if hasattr(self, "val_loader") and hasattr(self.val_loader, "dataset"):
+            self.val_loader.dataset.heatmap_sizes = self.heatmap_sizes
+
+    def _sigma_for_epoch(self, epoch: int) -> float:
+        """Compute decayed sigma rounded to int, reducing by 1 every `heatmap_decay_epoch` epochs."""
+        interval = self.heatmap_decay_epoch
+        if not interval or interval <= 0:
+            return self.initial_heatmap_sigma
+        decays = epoch // interval
+        decayed = round(self.initial_heatmap_sigma - decays)
+        return max(self.heatmap_min_sigma, decayed)
+
+    def _maybe_decay_heatmap(self, epoch: int):
+        """Shrink sigma gradually after the configured epoch, rounded to int."""
+        new_sigma = self._sigma_for_epoch(epoch)
+        if new_sigma != self.current_heatmap_sigma:
+            self.accelerator.print(f"[Heatmap] Sigma update at epoch {epoch}: {self.current_heatmap_sigma} -> {new_sigma}")
+            self._set_heatmap_sigma(new_sigma)
+
     def create_dataloaders(
         self,
         h5_path: Path,
@@ -473,6 +564,7 @@ class TrainingPipeline:
             patch_size=self.patch_size,
             transform=train_transforms,
             radius=self.radius,
+            heatmap_sizes=self.heatmap_sizes,
         )
         val_dataset = PatchAneurysmDataset(
             h5_path=h5_path,
@@ -480,6 +572,7 @@ class TrainingPipeline:
             patch_size=self.patch_size,
             transform=val_transforms,
             radius=self.radius,
+            heatmap_sizes=self.heatmap_sizes,
         )
 
         train_loader = DataLoader(
@@ -616,11 +709,15 @@ class TrainingPipeline:
             betas = (0.9, 0.999),
             eps=1e-8,
             weight_decay=self.weight_decay)
-        self.segmentation_loss = DiceLoss()
+        self.segmentation_loss = DiceSemimetricLoss()
         cls_pos_weight = getattr(self, "pos_weight", torch.tensor(1.0))
         cls_pos_weight = cls_pos_weight.to(self.device)
         self.classification_loss = nn.BCEWithLogitsLoss(pos_weight=cls_pos_weight)
-        self.criterion = SegmentationClassificationLoss(self.segmentation_loss, self.classification_loss, weights=self.weights)
+        self.criterion = SegmentationClassificationLoss(
+            self.segmentation_loss,
+            self.classification_loss,
+            weights=self.weights,
+        )
         self.model, self.optimizer = self.accelerator.prepare(self.model, self.optimizer)
         self._configure_scheduler()
         #Since we have to define our own training loop, we have to keep track
@@ -638,10 +735,13 @@ class TrainingPipeline:
 
         eps = 1e-6
         for epoch in range(1, self.epochs + 1):
+            self._maybe_decay_heatmap(epoch)
             self.model.train()
             train_losses = []
             train_dice_scores = []
+            train_core_list, train_peak_list, train_focus_list = [], [], []
             all_preds, all_labels = [], []
+            train_neg_mean_list, train_neg_max_list = [], []
 
             for x_batch, mask_batch, y_batch in tqdm(self.train_loader):
                 x_batch = x_batch.to(self.device, dtype=torch.float16, non_blocking=True)
@@ -674,26 +774,101 @@ class TrainingPipeline:
 
                 train_losses.append(self.accelerator.gather(loss.detach()).mean().item())
 
-                #Dice calculation
+                #Dice calculation (soft dice on soft targets)
                 with torch.no_grad():
                     mask_probs = torch.sigmoid(outputs[0].detach().to(torch.float32))
-                    targets = mask_batch.detach().to(torch.float32)
-                    pred_masks = (mask_probs >= 0.5).float()
+                    targets = mask_batch[:, self.primary_heatmap_index:self.primary_heatmap_index+1].detach().to(torch.float32)
+                    pos_mask = (y_batch.squeeze(1) > 0.5)
+                    if pos_mask.any():
+                        mask_probs_pos = mask_probs[pos_mask]
+                        targets_pos = targets[pos_mask]
+                    else:
+                        mask_probs_pos = targets_pos = None
+                    neg_mask = (y_batch.squeeze(1) <= 0.5)
+                    if neg_mask.any():
+                        mask_probs_neg = mask_probs[neg_mask]
+                        neg_mean = mask_probs_neg.mean(dim=(1, 2, 3, 4))
+                        neg_max = mask_probs_neg.amax(dim=(1, 2, 3, 4))
+                        train_neg_mean_list.append(neg_mean)
+                        train_neg_max_list.append(neg_max)
 
-                    pred_sum = pred_masks.sum(dim=(1, 2, 3, 4))
+                    pred_sum = mask_probs.sum(dim=(1, 2, 3, 4))
                     target_sum = targets.sum(dim=(1, 2, 3, 4))
-                    intersection = (pred_masks * targets).sum(dim=(1, 2, 3, 4))
+                    intersection = (mask_probs * targets).sum(dim=(1, 2, 3, 4))
                     dice = (2.0 * intersection + eps) / (pred_sum + target_sum + eps)
                     train_dice_scores.append(dice)
 
-                #Accuracy calculation
+                    # Binary core dice: threshold target and prediction
+                    if targets_pos is not None:
+                        tgt_bin = (targets_pos >= 0.1).float()
+                        pred_bin = (mask_probs_pos >= 0.5).float()
+                        pred_bsum = pred_bin.sum(dim=(1, 2, 3, 4))
+                        tgt_bsum = tgt_bin.sum(dim=(1, 2, 3, 4))
+                        inter_bin = (pred_bin * tgt_bin).sum(dim=(1, 2, 3, 4))
+                        core_dice = (2.0 * inter_bin + eps) / (pred_bsum + tgt_bsum + eps)
+
+                        # Peak localization error (voxels)
+                        pred_peak = mask_probs_pos.view(mask_probs_pos.shape[0], -1).argmax(dim=1)
+                        tgt_peak = targets_pos.view(targets_pos.shape[0], -1).argmax(dim=1)
+                        # convert flat index to z,y,x
+                        def unravel(idx, shape):
+                            d, h, w = shape
+                            z = idx // (h * w)
+                            y = (idx % (h * w)) // w
+                            x = idx % w
+                            return z, y, x
+                        shape = targets_pos.shape[-3:]
+                        pred_peak_coords = torch.stack([torch.tensor(unravel(i.item(), shape), device=mask_probs.device) for i in pred_peak])
+                        tgt_peak_coords = torch.stack([torch.tensor(unravel(i.item(), shape), device=mask_probs.device) for i in tgt_peak])
+                        peak_err = torch.norm(pred_peak_coords.to(torch.float32) - tgt_peak_coords.to(torch.float32), dim=1)
+
+                        # Focus ratio: mass inside radius vs total
+                        radius = 5.0
+                        grid_z = torch.arange(shape[0], device=mask_probs.device).view(-1, 1, 1)
+                        grid_y = torch.arange(shape[1], device=mask_probs.device).view(1, -1, 1)
+                        grid_x = torch.arange(shape[2], device=mask_probs.device).view(1, 1, -1)
+                        focus_scores = []
+                        for b in range(mask_probs_pos.shape[0]):
+                            cz, cy, cx = tgt_peak_coords[b]
+                            dist2 = (grid_z - cz) ** 2 + (grid_y - cy) ** 2 + (grid_x - cx) ** 2
+                            in_mask = dist2 <= radius ** 2
+                            mass_total = mask_probs_pos[b, 0].sum()
+                            mass_focus = (mask_probs_pos[b, 0] * in_mask).sum()
+                            focus_scores.append((mass_focus / (mass_total + eps)))
+                        focus_scores = torch.stack(focus_scores)
+                    else:
+                        core_dice = torch.tensor([], device=self.device)
+                        peak_err = torch.tensor([], device=self.device)
+                        focus_scores = torch.tensor([], device=self.device)
+
+                #Aggregate metrics
                 all_preds.append(outputs[1].detach())
                 all_labels.append(y_batch.detach())
+                train_core_list.append(core_dice)
+                train_peak_list.append(peak_err)
+                train_focus_list.append(focus_scores)
 
             #DICE loss stats
             train_dice_scores = torch.cat(train_dice_scores, dim=0).to(self.device, dtype=torch.float32)
             train_dice_scores = self._safe_gather(train_dice_scores)
             train_dice_mean = train_dice_scores.cpu().numpy().mean() if train_dice_scores.numel() > 0 else 0.0
+            # Core dice / peak / focus stats
+            core_all = torch.cat(train_core_list, dim=0).to(self.device, dtype=torch.float32) if train_core_list else torch.tensor([], device=self.device)
+            peak_all = torch.cat(train_peak_list, dim=0).to(self.device, dtype=torch.float32) if train_peak_list else torch.tensor([], device=self.device)
+            focus_all = torch.cat(train_focus_list, dim=0).to(self.device, dtype=torch.float32) if train_focus_list else torch.tensor([], device=self.device)
+            core_all = self._safe_gather(core_all)
+            peak_all = self._safe_gather(peak_all)
+            focus_all = self._safe_gather(focus_all)
+            train_core_dice_mean = core_all.cpu().numpy().mean() if core_all.numel() > 0 else 0.0
+            train_peak_mean = peak_all.cpu().numpy().mean() if peak_all.numel() > 0 else 0.0
+            train_focus_mean = focus_all.cpu().numpy().mean() if focus_all.numel() > 0 else 0.0
+            # Negative-only segmentation stats
+            neg_mean_all = torch.cat(train_neg_mean_list, dim=0).to(self.device, dtype=torch.float32) if train_neg_mean_list else torch.tensor([], device=self.device)
+            neg_max_all = torch.cat(train_neg_max_list, dim=0).to(self.device, dtype=torch.float32) if train_neg_max_list else torch.tensor([], device=self.device)
+            neg_mean_all = self._safe_gather(neg_mean_all)
+            neg_max_all = self._safe_gather(neg_max_all)
+            train_neg_prob_mean = neg_mean_all.cpu().numpy().mean() if neg_mean_all.numel() > 0 else 0.0
+            train_neg_prob_max = neg_max_all.cpu().numpy().mean() if neg_max_all.numel() > 0 else 0.0
 
             #Classification stats
             all_preds = torch.cat(all_preds, dim=0).to(self.device, dtype=torch.float32).contiguous()
@@ -720,6 +895,11 @@ class TrainingPipeline:
             history["train_ppv"].append(train_ppv)
             history["train_npv"].append(train_npv)
             history["train_dice"].append(train_dice_mean)
+            history.setdefault("train_core_dice_series", []).append(train_core_dice_mean)
+            history.setdefault("train_peak_err_series", []).append(train_peak_mean)
+            history.setdefault("train_focus_series", []).append(train_focus_mean)
+            history.setdefault("train_neg_prob_mean_series", []).append(train_neg_prob_mean)
+            history.setdefault("train_neg_prob_max_series", []).append(train_neg_prob_max)
 
             # --- Validation ---
             self.model.eval()
@@ -727,6 +907,8 @@ class TrainingPipeline:
             val_dice_scores = []
             val_preds_list, val_labels_list = [], []
             with torch.no_grad():
+                val_core_list, val_peak_list, val_focus_list = [], [], []
+                val_neg_mean_list, val_neg_max_list = [], []
                 for x_batch, mask_batch, y_batch in self.val_loader:
                     x_batch = x_batch.to(self.device, dtype=torch.float16, non_blocking=True)
                     mask_batch = mask_batch.to(self.device, dtype=torch.float16, non_blocking=True)
@@ -737,16 +919,71 @@ class TrainingPipeline:
                         loss = self.criterion(outputs, (mask_batch, y_batch), self.device)
                     val_losses.append(self.accelerator.gather(loss.detach()).mean().item())
 
-                    #DICE loss
+                    #DICE loss (soft dice on soft targets)
                     mask_probs = torch.sigmoid(outputs[0].detach().to(torch.float32))
-                    targets = mask_batch.detach().to(torch.float32)
-                    pred_masks = (mask_probs >= 0.5).float()
+                    targets = mask_batch[:, self.primary_heatmap_index:self.primary_heatmap_index+1].detach().to(torch.float32)
+                    pos_mask = (y_batch.squeeze(1) > 0.5)
+                    if pos_mask.any():
+                        mask_probs_pos = mask_probs[pos_mask]
+                        targets_pos = targets[pos_mask]
+                    else:
+                        mask_probs_pos = targets_pos = None
 
-                    pred_sum = pred_masks.sum(dim=(1, 2, 3, 4))
+                    pred_sum = mask_probs.sum(dim=(1, 2, 3, 4))
                     target_sum = targets.sum(dim=(1, 2, 3, 4))
-                    intersection = (pred_masks * targets).sum(dim=(1, 2, 3, 4))
+                    intersection = (mask_probs * targets).sum(dim=(1, 2, 3, 4))
                     dice = (2.0 * intersection + eps) / (pred_sum + target_sum + eps)
                     val_dice_scores.append(dice)
+
+                    # Auxiliary metrics
+                    if targets_pos is not None:
+                        tgt_bin = (targets_pos >= 0.1).float()
+                        pred_bin = (mask_probs_pos >= 0.5).float()
+                        pred_bsum = pred_bin.sum(dim=(1, 2, 3, 4))
+                        tgt_bsum = tgt_bin.sum(dim=(1, 2, 3, 4))
+                        inter_bin = (pred_bin * tgt_bin).sum(dim=(1, 2, 3, 4))
+                        core_dice = (2.0 * inter_bin + eps) / (pred_bsum + tgt_bsum + eps)
+
+                        pred_peak = mask_probs_pos.view(mask_probs_pos.shape[0], -1).argmax(dim=1)
+                        tgt_peak = targets_pos.view(targets_pos.shape[0], -1).argmax(dim=1)
+                        shape = targets_pos.shape[-3:]
+                        def unravel(idx, shape):
+                            d, h, w = shape
+                            z = idx // (h * w)
+                            y = (idx % (h * w)) // w
+                            x = idx % w
+                            return z, y, x
+                        pred_peak_coords = torch.stack([torch.tensor(unravel(i.item(), shape), device=mask_probs.device) for i in pred_peak])
+                        tgt_peak_coords = torch.stack([torch.tensor(unravel(i.item(), shape), device=mask_probs.device) for i in tgt_peak])
+                        peak_err = torch.norm(pred_peak_coords.to(torch.float32) - tgt_peak_coords.to(torch.float32), dim=1)
+
+                        radius = 5.0
+                        grid_z = torch.arange(shape[0], device=mask_probs.device).view(-1, 1, 1)
+                        grid_y = torch.arange(shape[1], device=mask_probs.device).view(1, -1, 1)
+                        grid_x = torch.arange(shape[2], device=mask_probs.device).view(1, 1, -1)
+                        focus_scores = []
+                        for b in range(mask_probs_pos.shape[0]):
+                            cz, cy, cx = tgt_peak_coords[b]
+                            dist2 = (grid_z - cz) ** 2 + (grid_y - cy) ** 2 + (grid_x - cx) ** 2
+                            in_mask = dist2 <= radius ** 2
+                            mass_total = mask_probs_pos[b, 0].sum()
+                            mass_focus = (mask_probs_pos[b, 0] * in_mask).sum()
+                            focus_scores.append((mass_focus / (mass_total + eps)))
+                        focus_scores = torch.stack(focus_scores)
+                    else:
+                        core_dice = torch.tensor([], device=self.device)
+                        peak_err = torch.tensor([], device=self.device)
+                        focus_scores = torch.tensor([], device=self.device)
+                    # Negative stats
+                    neg_mask = (y_batch.squeeze(1) <= 0.5)
+                    if neg_mask.any():
+                        mask_probs_neg = mask_probs[neg_mask]
+                        val_neg_mean_list.append(mask_probs_neg.mean(dim=(1, 2, 3, 4)))
+                        val_neg_max_list.append(mask_probs_neg.amax(dim=(1, 2, 3, 4)))
+
+                    val_core_list.append(core_dice)
+                    val_peak_list.append(peak_err)
+                    val_focus_list.append(focus_scores)
 
                     #Classification loss
                     preds = self._safe_gather(outputs[1].detach().to(torch.float32))
@@ -765,6 +1002,22 @@ class TrainingPipeline:
             val_dice_scores = torch.cat(val_dice_scores, dim=0).to(self.device, dtype=torch.float32)
             val_dice_scores = self._safe_gather(val_dice_scores)
             val_dice_mean = val_dice_scores.cpu().numpy().mean() if val_dice_scores.numel() > 0 else 0.0
+            # Validation auxiliary metrics
+            core_all = torch.cat(val_core_list, dim=0).to(self.device, dtype=torch.float32) if val_core_list else torch.tensor([], device=self.device)
+            peak_all = torch.cat(val_peak_list, dim=0).to(self.device, dtype=torch.float32) if val_peak_list else torch.tensor([], device=self.device)
+            focus_all = torch.cat(val_focus_list, dim=0).to(self.device, dtype=torch.float32) if val_focus_list else torch.tensor([], device=self.device)
+            core_all = self._safe_gather(core_all)
+            peak_all = self._safe_gather(peak_all)
+            focus_all = self._safe_gather(focus_all)
+            val_core_dice_mean = core_all.cpu().numpy().mean() if core_all.numel() > 0 else 0.0
+            val_peak_mean = peak_all.cpu().numpy().mean() if peak_all.numel() > 0 else 0.0
+            val_focus_mean = focus_all.cpu().numpy().mean() if focus_all.numel() > 0 else 0.0
+            neg_mean_all = torch.cat(val_neg_mean_list, dim=0).to(self.device, dtype=torch.float32) if val_neg_mean_list else torch.tensor([], device=self.device)
+            neg_max_all = torch.cat(val_neg_max_list, dim=0).to(self.device, dtype=torch.float32) if val_neg_max_list else torch.tensor([], device=self.device)
+            neg_mean_all = self._safe_gather(neg_mean_all)
+            neg_max_all = self._safe_gather(neg_max_all)
+            val_neg_prob_mean = neg_mean_all.cpu().numpy().mean() if neg_mean_all.numel() > 0 else 0.0
+            val_neg_prob_max = neg_max_all.cpu().numpy().mean() if neg_max_all.numel() > 0 else 0.0
 
             val_preds_np = np.concatenate(val_preds_list, axis=0).ravel()
             val_labels_np = np.concatenate(val_labels_list, axis=0).ravel()
@@ -784,13 +1037,22 @@ class TrainingPipeline:
             history["val_ppv"].append(val_ppv)
             history["val_npv"].append(val_npv)
             history["val_dice"].append(val_dice_mean)
+            history.setdefault("val_core_dice_series", []).append(val_core_dice_mean)
+            history.setdefault("val_peak_err_series", []).append(val_peak_mean)
+            history.setdefault("val_focus_series", []).append(val_focus_mean)
+            history.setdefault("val_neg_prob_mean_series", []).append(val_neg_prob_mean)
+            history.setdefault("val_neg_prob_max_series", []).append(val_neg_prob_max)
 
             self.accelerator.print(
-                f"Epoch {epoch}/{self.epochs} | "
-                f"Train Loss: {history['train_loss'][-1]:.4f} | Acc: {train_acc:.4f} | "
-                f"Sens: {train_sens:.4f} | PPV: {train_ppv:.4f} | NPV: {train_npv:.4f} | Dice: {history['train_dice'][-1]:.4f} | "
-                f"Val Loss: {history['val_loss'][-1]:.4f} | Acc: {val_acc:.4f} | "
-                f"Sens: {val_sens:.4f} | PPV: {val_ppv:.4f} | NPV: {val_npv:.4f} | Dice: {history['val_dice'][-1]:.4f}"
+                f"Epoch {epoch}/{self.epochs}\n"
+                f"  Train | Loss {history['train_loss'][-1]:.4f} | Acc {train_acc:.4f} | Sens {train_sens:.4f} | "
+                f"PPV {train_ppv:.4f} | NPV {train_npv:.4f} | Dice {history['train_dice'][-1]:.4f} | "
+                f"Core {train_core_dice_mean:.4f} | Peak {train_peak_mean:.2f} | Focus {train_focus_mean:.4f} | "
+                f"NegMean {train_neg_prob_mean:.4f} | NegMax {train_neg_prob_max:.4f}\n"
+                f"    Val | Loss {history['val_loss'][-1]:.4f} | Acc {val_acc:.4f} | Sens {val_sens:.4f} | "
+                f"PPV {val_ppv:.4f} | NPV {val_npv:.4f} | Dice {history['val_dice'][-1]:.4f} | "
+                f"Core {val_core_dice_mean:.4f} | Peak {val_peak_mean:.2f} | Focus {val_focus_mean:.4f} | "
+                f"NegMean {val_neg_prob_mean:.4f} | NegMax {val_neg_prob_max:.4f}"
             )
 
             epoch_metrics = {
@@ -800,12 +1062,22 @@ class TrainingPipeline:
                 "train/ppv": train_ppv,
                 "train/npv": train_npv,
                 "train/dice": history["train_dice"][-1],
+                "train/core_dice": train_core_dice_mean,
+                "train/peak_err": train_peak_mean,
+                "train/focus": train_focus_mean,
+                "train/neg_prob_mean": train_neg_prob_mean,
+                "train/neg_prob_max": train_neg_prob_max,
                 "val/loss": history["val_loss"][-1],
                 "val/acc": val_acc,
                 "val/sensitivity": val_sens,
                 "val/ppv": val_ppv,
                 "val/npv": val_npv,
                 "val/dice": history["val_dice"][-1],
+                "val/core_dice": val_core_dice_mean,
+                "val/peak_err": val_peak_mean,
+                "val/focus": val_focus_mean,
+                "val/neg_prob_mean": val_neg_prob_mean,
+                "val/neg_prob_max": val_neg_prob_max,
                 "lr": self.optimizer.param_groups[0]["lr"],
                 "epoch": epoch,
             }
