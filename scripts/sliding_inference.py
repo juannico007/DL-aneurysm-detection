@@ -41,12 +41,12 @@ from model.unet import UNet  # noqa: E402
 
 HYPERPARAMS: Dict[str, object] = {
     "h5_path": Path("h5-aneurysm.h5"),
-    "series_id": "1.2.826.0.1.3680043.8.498.10035643165968342618460849823699311381",
-    "checkpoint": Path("cloud_models/MihaiB-dev/patches-3d-unet_002/MihaiB-dev_patches-3d-unet_002.pt"),
+    "series_id": "1.2.826.0.1.3680043.8.498.10633029764731181926825032640422192656",
+    "checkpoint": Path("cloud_models/MihaiB-dev/gaussian-3d-u-net_001/MihaiB-dev_gaussian-3d-u-net_001.pt"),
     "localizers": Path("train_localizers.csv"),  # optional; builds GT sphere mask
-    "radius": 5.0,  # sphere radius for GT mask
+    "radius": 15.0,  # sphere radius for GT mask
     # Optional: path to hyperparameters.json (will use its "unet" block if present)
-    "hyperparams_json":  Path("cloud_models/MihaiB-dev/patches-3d-unet_002/hyperparameters.json"),
+    "hyperparams_json":  Path("cloud_models/MihaiB-dev/gaussian-3d-u-net_001/hyperparameters.json"),
     # Optional: override UNet args directly to match training checkpoint
     "unet_kwargs": {
         # e.g., "start_filters": 16, "out_channels": 1, "normalization": "group8"
@@ -55,9 +55,11 @@ HYPERPARAMS: Dict[str, object] = {
     "stride": 24,
     "threshold": 0.5,
     "device": "cuda" if torch.cuda.is_available() else "cpu",
-    "output_prefix": Path("runs/sliding_vis"),
+    "output_prefix": Path("runs/gaussian-3d-u-net_001"),
     "use_mixed_precision": False,
     "save_nifti": True,
+    "blend_mode": "gaussian",  # one of {"hann", "gaussian", "naive"}
+    "gaussian_sigma": None,  # if None, defaults to patch_size / 6
 }
 
 
@@ -122,6 +124,29 @@ def make_sphere_mask(shape: Sequence[int], center: Sequence[float], radius: floa
     return (dist2 <= radius**2).astype(np.uint8)
 
 
+def build_weight_mask(patch_size: int, mode: str = "hann", sigma: float | None = None) -> np.ndarray:
+    """Return a 3D weighting mask for overlap-add blending."""
+    mode = (mode or "hann").lower()
+    if mode == "naive":
+        return np.ones((patch_size, patch_size, patch_size), dtype=np.float32)
+    if mode == "hann":
+        h = np.hanning(patch_size)
+        mask = h[:, None, None] * h[None, :, None] * h[None, None, :]
+        return mask.astype(np.float32)
+    if mode == "gaussian":
+        if sigma is None:
+            sigma = patch_size / 6.0
+        coords = np.linspace(-(patch_size - 1) / 2.0, (patch_size - 1) / 2.0, patch_size)
+        zz, yy, xx = np.meshgrid(coords, coords, coords, indexing="ij")
+        mask = np.exp(-(xx**2 + yy**2 + zz**2) / (2.0 * sigma * sigma))
+        mask -= mask.min()
+        vmax = mask.max()
+        if vmax > 0:
+            mask /= vmax
+        return mask.astype(np.float32)
+    raise ValueError(f"Unsupported blend_mode '{mode}'. Use 'naive', 'hann', or 'gaussian'.")
+
+
 def run_inference():
     p = HYPERPARAMS
     h5_path = Path(p["h5_path"])
@@ -145,7 +170,7 @@ def run_inference():
         loc_points = load_localizer_points(Path(loc_path))
         pts = loc_points.get(series_id, [])
         if pts:
-            rad = float(p.get("radius", 5.0))
+            rad = float(p.get("radius", 15.0))
             gt_mask = np.zeros_like(vol, dtype=np.uint8)
             for c in pts:
                 gt_mask |= make_sphere_mask(vol.shape, c, radius=rad)
@@ -171,6 +196,11 @@ def run_inference():
 
     prob = np.zeros_like(vol, dtype=np.float32)
     counts = np.zeros_like(vol, dtype=np.float32)
+    weight_mask = build_weight_mask(
+        patch_size,
+        mode=p.get("blend_mode", "hann"),
+        sigma=p.get("gaussian_sigma"),
+    )
 
     use_amp = bool(p.get("use_mixed_precision", False) and device.type == "cuda")
 
@@ -183,8 +213,8 @@ def run_inference():
             else:
                 seg_logits, _ = model(patch_t)
             seg_probs = torch.sigmoid(seg_logits.float()).cpu().numpy()[0, 0]
-            prob[z : z + patch_size, y : y + patch_size, x : x + patch_size] += seg_probs
-            counts[z : z + patch_size, y : y + patch_size, x : x + patch_size] += 1.0
+            prob[z : z + patch_size, y : y + patch_size, x : x + patch_size] += seg_probs * weight_mask
+            counts[z : z + patch_size, y : y + patch_size, x : x + patch_size] += weight_mask
 
     counts[counts == 0] = 1.0
     prob /= counts
@@ -199,7 +229,7 @@ def run_inference():
         stride=stride,
         threshold=threshold,
         device=str(device),
-        radius=float(p.get("radius", 5.0)),
+        radius=float(p.get("radius", 15.0)),
         localizers=str(loc_path) if loc_path else "",
     )
     np.savez_compressed(

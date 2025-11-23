@@ -17,6 +17,7 @@ import pandas as pd
 import csv
 from dataclasses import dataclass
 import h5py
+import math
 
 class DiceLoss(nn.Module):
     def __init__(self, weight=None, size_average=True):
@@ -73,18 +74,22 @@ class SegmentationClassificationLoss(nn.Module):
     """
     Class for dice loss with bce for classification
     Parameters:
-        weights: array with 2 values, segmentation weight and classification weight for the loss
+        seg_weight: weight for segmentation loss
+        cls_weight: weight for classification loss
         segmentation: Function to evaluate the segmentation loss
         classification: Function to evaluate the classification loss
     Returns: 
         Loss value for the patient
     """
-    def __init__(self, segmentation = DiceLoss, classification = nn.BCEWithLogitsLoss, weights=[0.5, 0.5], size_average=True):
+    def __init__(self, segmentation = DiceLoss, classification = nn.BCEWithLogitsLoss, seg_weight: float = 0.5, cls_weight: float = 0.5, neg_mean_lambda: float = 0.0, neg_max_lambda: float = 0.0, size_average=True):
         super(SegmentationClassificationLoss, self).__init__()
-        self.weights = weights
-        print("weights:", self.weights)
+        self.seg_weight = seg_weight
+        self.cls_weight = cls_weight
+        print("weights:", {"seg": self.seg_weight, "cls": self.cls_weight, "neg_mean": neg_mean_lambda, "neg_max": neg_max_lambda})
         self.segmentation = segmentation
         self.classification = classification
+        self.neg_mean_lambda = float(neg_mean_lambda)
+        self.neg_max_lambda = float(neg_max_lambda)
 
     def forward(self, inputs, targets, device):
         #Divide inputs and targets for dice loss and bce
@@ -98,9 +103,21 @@ class SegmentationClassificationLoss(nn.Module):
         #print("IN LOSS - cls_in.dtype, device, requires_grad:", classification_input.dtype, classification_input.device, classification_input.requires_grad)
         
         segmentation_loss = self._segmentation_loss(segmentation_input, segmentation_target)
-        if self.weights[1] != 0:
+
+        # Penalize segmentation probabilities on negative patients to suppress false positives
+        if self.neg_mean_lambda > 0 or self.neg_max_lambda > 0:
+            probs = torch.sigmoid(segmentation_input).to(dtype=torch.float32)
+            neg_mask = (classification_target.squeeze(1) <= 0.5)
+            if neg_mask.any():
+                neg_probs = probs[neg_mask]
+                if self.neg_mean_lambda > 0:
+                    segmentation_loss = segmentation_loss + self.neg_mean_lambda * neg_probs.mean()
+                if self.neg_max_lambda > 0:
+                    segmentation_loss = segmentation_loss + self.neg_max_lambda * neg_probs.max()
+
+        if self.cls_weight != 0:
             classification_loss = self.classification(classification_input, classification_target)
-            return self.weights[0] * segmentation_loss + self.weights[1] * classification_loss
+            return self.seg_weight * segmentation_loss + self.cls_weight * classification_loss
         return segmentation_loss
 
     def _segmentation_loss(self, inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
@@ -430,8 +447,9 @@ class TrainingPipeline:
         train_ratio: float = 0.8,
         split_seed: int = 42,
         scheduler_config: Optional[Dict[str, Any]] = None,
-        weights : list = [0.5,0.5],
-    ):
+        loss_weights: Optional[Dict[str, float]] = None,
+        neg_warmup_epochs: int = 0,
+        ):
         """
         Initialize training pipeline.
         
@@ -446,7 +464,7 @@ class TrainingPipeline:
             lr_reduction_factor: Learning rate reduction on plateau
             min_lr: Minimum value for the learning rate
             checkpoint_path: Path to save best model
-            weights: Weight distribution for segmentation/classification
+            loss_weights: dict with weights for segmentation/classification and negative penalties
         """
         self.model = model
         self.batch_size = batch_size
@@ -474,7 +492,15 @@ class TrainingPipeline:
             "step_size": 100,
             "gamma": 0.96,
         }
-        self.weights = weights
+        lw = loss_weights or {}
+        self.seg_weight = float(lw.get("segmentation", 0.7))
+        self.cls_weight = float(lw.get("classification", 0.3))
+        self.base_neg_mean_lambda = float(lw.get("neg_mean", 0.1))
+        self.base_neg_max_lambda = float(lw.get("neg_max", 0.05))
+        self.neg_mean_lambda = self.base_neg_mean_lambda
+        self.neg_max_lambda = self.base_neg_max_lambda
+        self.neg_warmup_epochs = int(neg_warmup_epochs)
+        self.neg_ramp_epochs = max(1, self.epochs - self.neg_warmup_epochs)
 
         self.scheduler_step_mode: Optional[str] = None
         self.scheduler: Optional[optim.lr_scheduler._LRScheduler] = None
@@ -508,7 +534,24 @@ class TrainingPipeline:
         new_sigma = self._sigma_for_epoch(epoch)
         if new_sigma != self.current_heatmap_sigma:
             self.accelerator.print(f"[Heatmap] Sigma update at epoch {epoch}: {self.current_heatmap_sigma} -> {new_sigma}")
-            self._set_heatmap_sigma(new_sigma)
+        self._set_heatmap_sigma(new_sigma)
+
+    def _neg_penalty_scale(self, epoch: int) -> float:
+        """Gaussian ramp from 0 to 1 after warmup for negative suppression terms."""
+        if self.neg_ramp_epochs <= 0:
+            return 1.0
+        t = (epoch - self.neg_warmup_epochs) / max(1, self.neg_ramp_epochs)
+        t = min(max(t, 0.0), 1.0)
+        return math.exp(-5.0 * (1.0 - t) * (1.0 - t))
+
+    def _update_neg_lambdas(self, epoch: int):
+        """Update neg penalty lambdas according to ramp schedule."""
+        scale = self._neg_penalty_scale(epoch)
+        self.neg_mean_lambda = self.base_neg_mean_lambda * scale
+        self.neg_max_lambda = self.base_neg_max_lambda * scale
+        if hasattr(self, "criterion"):
+            self.criterion.neg_mean_lambda = self.neg_mean_lambda
+            self.criterion.neg_max_lambda = self.neg_max_lambda
 
     def create_dataloaders(
         self,
@@ -716,7 +759,10 @@ class TrainingPipeline:
         self.criterion = SegmentationClassificationLoss(
             self.segmentation_loss,
             self.classification_loss,
-            weights=self.weights,
+            seg_weight=self.seg_weight,
+            cls_weight=self.cls_weight,
+            neg_mean_lambda=self.neg_mean_lambda,
+            neg_max_lambda=self.neg_max_lambda,
         )
         self.model, self.optimizer = self.accelerator.prepare(self.model, self.optimizer)
         self._configure_scheduler()
@@ -736,6 +782,7 @@ class TrainingPipeline:
         eps = 1e-6
         for epoch in range(1, self.epochs + 1):
             self._maybe_decay_heatmap(epoch)
+            self._update_neg_lambdas(epoch)
             self.model.train()
             train_losses = []
             train_dice_scores = []

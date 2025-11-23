@@ -18,7 +18,7 @@ HYPERPARAMS = {
     "input_shape": (256, 256, 256),
     "batch_size": 20,
     "grad_accum": 2,
-    "epochs": 24,
+    "epochs": 40,
     "learning_rate": 1e-4,
     "weight_decay": 1e-2,
     # "scheduler": {
@@ -26,11 +26,16 @@ HYPERPARAMS = {
     #     "step_size": 100,
     #     "gamma": 0.96,
     # },
-    "proportion_to_use": 1.0,
     "max_voxels": 500 * 500 * 500,
-    "weights": [0.7,0.3],
+    "loss_weights": {
+        "segmentation": 0.9,
+        "classification": 0.1,
+        "neg_mean": 0.1,
+        "neg_max": 0.05,
+    },
+    "neg_warmup_epochs": 15,
     "heatmap_sigma": 15,
-    "heatmap_decay_epoch": 20,
+    "heatmap_decay_epoch": 50,
     # "scheduler":{
     #     "name" : "cosine",
     #     "eta_min": 1e-6
@@ -40,7 +45,7 @@ HYPERPARAMS = {
         "name": "plateau",
         "mode": "min",
         "factor": 0.5,
-        "patience": 10,
+        "patience": 5,
         "min_lr": 1e-6,
     },
 
@@ -62,7 +67,7 @@ HYPERPARAMS = {
         "up_mode": "transposed",
         "middle_neurons": 256,
         "class_output": 1,
-        "dropout": 0,
+        "dropout": 0.3,
     },
 }
 
@@ -272,7 +277,8 @@ def main():
         train_ratio=hyperparams.get("train_ratio", 0.8),
         split_seed=hyperparams.get("split_seed", 42),
         scheduler_config=hyperparams["scheduler"],
-        weights=hyperparams["weights"]
+        loss_weights=hyperparams.get("loss_weights"),
+        neg_warmup_epochs=hyperparams.get("neg_warmup_epochs", 0),
     )
 
     print("\n[4/5] Creating Pytorch dataloaders...")
