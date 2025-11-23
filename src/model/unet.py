@@ -115,6 +115,89 @@ class Concatenate(nn.Module):
         x = torch.cat((layer_1, layer_2), 1)
 
         return x
+    
+class GridAttentionBlock(nn.Module):
+    def __init__(self, in_channels, gating_channels, inter_channels=None, sub_sample_factor=(2,2,2)):
+        super(GridAttentionBlock, self).__init__()
+
+        self.in_channels = in_channels
+        self.gating_channels = gating_channels
+        self.sub_sample_factor = sub_sample_factor
+        self.sub_sample_kernel_size = sub_sample_factor
+        self.inter_channels = inter_channels
+        self.upsample_mode = 'trilinear'
+        
+        if self.inter_channels is None:
+            self.inter_channels = in_channels // 2
+            if self.inter_channels == 0:
+                self.inter_channels = 1
+                
+        self.W = nn.Sequential(
+            nn.Conv3d(
+                in_channels=self.in_channels,
+                out_channels=self.in_channels,
+                kernel_size=1,
+                stride=1,
+                padding=0
+            ),
+            nn.BatchNorm3d(self.in_channels)
+        )
+        
+        self.theta = nn.Conv3d(
+                in_channels=self.in_channels,
+                out_channels=self.inter_channels,
+                kernel_size=self.sub_sample_kernel_size,
+                stride=self.sub_sample_factor,
+                padding=0,
+                bias=False
+            )
+        
+        self.phi = nn.Conv3d(
+                in_channels=self.gating_channels,
+                out_channels=self.inter_channels,
+                kernel_size=1,
+                stride=1,
+                padding=0,
+                bias=True
+            )
+        
+        self.psi = nn.Conv3d(
+                in_channels=self.inter_channels,
+                out_channels=1,
+                kernel_size=1,
+                stride=1,
+                padding=0,
+                bias=True
+            )
+        
+        self.init_weights()
+
+    def forward(self, x, g):
+        theta_x = self.theta(x)
+        phi_g = F.interpolate(self.phi(g), size=theta_x.shape[2:], mode=self.upsample_mode, align_corners=False)
+        f = F.relu(theta_x + phi_g, inplace=True)
+        sigm_psi_f = torch.sigmoid(self.psi(f))
+        sigm_psi_f = F.interpolate(sigm_psi_f, size=x.shape[2:], mode=self.upsample_mode, align_corners=False)
+        y = sigm_psi_f.expand_as(x) * x
+        wy = self.W(y)
+
+        return wy, sigm_psi_f
+    
+    def init_weights(self):
+            def weight_init(m):
+                classname = m.__class__.__name__
+                if classname.find('Conv') != -1:
+                    nn.init.kaiming_normal_(m.weight.data, a=0, mode='fan_in')
+                elif classname.find('Linear') != -1:
+                    nn.init.kaiming_normal_(m.weight.data, a=0, mode='fan_in')
+                elif classname.find('BatchNorm') != -1:
+                    nn.init.normal_(m.weight.data, 1.0, 0.02)
+                    nn.init.constant_(m.bias.data, 0.0)
+            self.apply(weight_init)
+
+class FillerBlock(nn.Module):
+    def forward(self, x, g):
+        return x, None
 
 class DownBlock(nn.Module):
     """
@@ -204,7 +287,8 @@ class UpBlock(nn.Module):
         activation: str = 'relu',
         normalization: str = 'batch',
         conv_mode: str = 'same',
-        up_mode: str = 'transposed'
+        up_mode: str = 'transposed',
+        attention: bool = False
     ):
         super().__init__()
 
@@ -229,6 +313,11 @@ class UpBlock(nn.Module):
             self.norm1 = get_normalization(normalization=self.normalization, num_channels=self.out_channels)
             self.norm2 = get_normalization(normalization=self.normalization, num_channels=self.out_channels)
             self.norm3 = get_normalization(normalization=self.normalization, num_channels=self.out_channels)
+            
+        if attention:
+            self.attention = GridAttentionBlock(in_channels=in_channels // 2, gating_channels=in_channels)
+        else:
+            self.attention = FillerBlock()
 
         self.concat = Concatenate()
 
@@ -236,6 +325,7 @@ class UpBlock(nn.Module):
         self.activations = []
         up_layer = self.up(decoder_layer)
         cropped_encoder_layer, dec_layer = autocrop(encoder_layer, up_layer)
+        gated_encoder, att = self.attention(cropped_encoder_layer, decoder_layer)
 
         if self.up_mode != 'transposed':
             up_layer = self.conv1(up_layer)
@@ -244,7 +334,7 @@ class UpBlock(nn.Module):
         if self.normalization:
             up_layer = self.norm1(up_layer)
 
-        merged_layer = self.concat(up_layer, cropped_encoder_layer)
+        merged_layer = self.concat(up_layer, gated_encoder)
         y = self.conv2(merged_layer)
         y = self.act2(y)
         self.activations.append(y)
@@ -344,6 +434,7 @@ class UNet(nn.Module):
         middle_neurons: int = 256,
         class_output: int = 1,
         dropout: float = 0,
+        attention: bool = False,
     ):
         super().__init__()
 
@@ -358,6 +449,7 @@ class UNet(nn.Module):
         self.middle_neurons = middle_neurons
         self.class_outputs = class_output
         self.dropout = dropout
+        self.attention = attention
 
         self.down_blocks = []
         self.up_blocks = []
@@ -401,7 +493,8 @@ class UNet(nn.Module):
                 activation=self.activation,
                 normalization=self.normalization,
                 conv_mode=self.conv_mode,
-                up_mode=self.up_mode
+                up_mode=self.up_mode,
+                attention=self.attention
             )
 
             self.up_blocks.append(up_block)
@@ -416,12 +509,16 @@ class UNet(nn.Module):
 
     @staticmethod
     def weight_init(module, method, **kwargs):
-        if isinstance(module, (nn.Conv3d, nn.ConvTranspose3d)):
+        if isinstance(module, GridAttentionBlock):
+            return
+        if isinstance(module, (nn.Conv3d, nn.ConvTranspose3d)) and getattr(module, 'weight') is not None:
             method(module.weight, **kwargs)
 
     @staticmethod
     def bias_init(module, method, **kwargs):
-        if isinstance(module, (nn.Conv3d, nn.ConvTranspose3d)):
+        if isinstance(module, GridAttentionBlock):
+            return
+        if isinstance(module, (nn.Conv3d, nn.ConvTranspose3d)) and getattr(module, 'bias') is not None:
             method(module.bias, **kwargs)
 
     def initialize_parameters(
