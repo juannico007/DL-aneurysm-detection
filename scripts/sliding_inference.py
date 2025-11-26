@@ -40,13 +40,13 @@ from model.unet import UNet  # noqa: E402
 
 
 HYPERPARAMS: Dict[str, object] = {
-    "h5_path": Path("h5-aneurysm.h5"),
+    "h5_path": Path("src/train_dataset.h5"),
     "series_id": "1.2.826.0.1.3680043.8.498.10633029764731181926825032640422192656",
-    "checkpoint": Path("cloud_models/MihaiB-dev/gaussian-3d-u-net_001/MihaiB-dev_gaussian-3d-u-net_001.pt"),
-    "localizers": Path("train_localizers.csv"),  # optional; builds GT sphere mask
+    "checkpoint": Path("cloud_models/juannico007/Nico_cascade_U_net/juannico007_Nico_cascade_U_net.pt"),
+    "localizers": Path("dataset_split/train_localizers.csv"),  # optional; builds GT sphere mask
     "radius": 15.0,  # sphere radius for GT mask
     # Optional: path to hyperparameters.json (will use its "unet" block if present)
-    "hyperparams_json":  Path("cloud_models/MihaiB-dev/gaussian-3d-u-net_001/hyperparameters.json"),
+    "hyperparams_json":  Path("cloud_models/juannico007/Nico_cascade_U_net/hyperparameters.json"),
     # Optional: override UNet args directly to match training checkpoint
     "unet_kwargs": {
         # e.g., "start_filters": 16, "out_channels": 1, "normalization": "group8"

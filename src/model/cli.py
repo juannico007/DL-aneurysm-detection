@@ -12,12 +12,12 @@ os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 MODE_ENV_VAR = "TRAINING_MODE"
 
 HYPERPARAMS = {
-    "data_dir": "train_dataset.h5",
-    "patch_csv": "patches/patches.csv",
+    "data_dir": "src/train_dataset.h5",
+    "patch_csv": "src/train_patches.csv",
     "proportion_to_use": 1.0,
-    "input_shape": (256, 256, 256),
+    "input_shape": (64, 64, 64),
     "batch_size": 20,
-    "grad_accum": 2,
+    "grad_accum": 4,
     "epochs": 40,
     "learning_rate": 1e-4,
     "weight_decay": 1e-2,
@@ -28,10 +28,10 @@ HYPERPARAMS = {
     # },
     "max_voxels": 500 * 500 * 500,
     "loss_weights": {
-        "segmentation": 0.9,
-        "classification": 0.1,
-        "neg_mean": 0.1,
-        "neg_max": 0.05,
+        "segmentation": 0.5,
+        "classification": 0.5,
+        "neg_mean": 0,
+        "neg_max": 0,
     },
     "neg_warmup_epochs": 15,
     "heatmap_sigma": 15,
@@ -55,14 +55,14 @@ HYPERPARAMS = {
     
     "train_ratio": 0.7,
     "lr_reduction_epochs": 4,
-    "radius": 15,
+    "radius": 5,
     "unet": {
         "in_channels": 1,
         "out_channels": 1,
         "n_blocks": 4,
         "start_filters": 16,
         "activation": "relu",
-        "normalization": "group4",
+        "normalization": "batch",
         "conv_mode": "same",
         "up_mode": "transposed",
         "middle_neurons": 256,

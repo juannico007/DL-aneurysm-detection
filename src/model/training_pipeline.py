@@ -801,23 +801,19 @@ class TrainingPipeline:
                     with self.accelerator.autocast():
                         outputs = self.model(x_batch)
                     #print("Classifier logits:", outputs[1].min(), "true label:", y_batch)
-                    loss = self.criterion(outputs, (mask_batch, y_batch), self.device)
-                    # just before accelerator.backward(loss)
-                    #print("LOSS:", loss, "device:", loss.device, "dtype:", loss.dtype, "requires_grad:", loss.requires_grad)
-                    seg_logits, cls_logits = outputs
-                    #print("seg_logits.requires_grad:", seg_logits.requires_grad, "device:", seg_logits.device, "dtype:", seg_logits.dtype)
-                    #print("cls_logits.requires_grad:", cls_logits.requires_grad, "device:", cls_logits.device, "dtype:", cls_logits.dtype)
-                    with torch.autograd.set_detect_anomaly(True):
+                        loss = self.criterion(outputs, (mask_batch, y_batch), self.device)
                         self.accelerator.backward(loss)
-
-                    # IMPORTANT — only clip when gradients exist
                     if self.accelerator.sync_gradients:
-                        self.accelerator.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-
-                    self.optimizer.step()
-                    self.optimizer.zero_grad(set_to_none=True)
-                    if self.scheduler and self.scheduler_step_mode == "batch":
-                        self.scheduler.step()
+                        max_norm = 5
+                        unclipped_global_norm = self.accelerator.clip_grad_norm_(self.model.parameters(), max_norm=max_norm)
+                        self.accelerator.print(
+                                f"[GRAD] Max Norm: {max_norm:.2f} | Unclipped Global Norm: {unclipped_global_norm:.4f}"
+                            )
+                    
+                        self.optimizer.step()
+                        self.optimizer.zero_grad(set_to_none=True)
+                        if self.scheduler and self.scheduler_step_mode == "batch":
+                            self.scheduler.step()
 
                 train_losses.append(self.accelerator.gather(loss.detach()).mean().item())
 
