@@ -23,13 +23,16 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import h5py
 import numpy as np
+import pandas as pd
 
 
 # Editable hyperparameters (similar to training_pipeline style)
 HYPERPARAMS = {
     "h5": Path("train_dataset.h5"),
     "localizers": Path("train_localizers.csv"),
+    "patients_csv": Path("train.csv"),
     "output_dir": Path("patches"),
+    "number_of_patches_healthy": 10,
     "patch_size": 64,
     "pos_neg_ratio": "1:5",
     "radius": 5.0,
@@ -214,7 +217,7 @@ def generate_patches(
         raise ValueError("No localizer points found; cannot generate positive patches.")
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    csv_path = output_dir / "patches.csv"
+    csv_path = output_dir / "train_patches.csv"
     meta_path = output_dir / "metadata.json"
 
     rows: List[List[str]] = []
@@ -383,6 +386,69 @@ def generate_patches(
     print(f"[Done] Wrote {len(rows)} rows to {csv_path}")
     print(f"[Done] Metadata saved to {meta_path}")
 
+def generate_healthy_patients_patches(
+        h5_path,
+        patients_csv,
+        output_dir,
+        patch_size,
+        number_of_patches,
+        seed,
+        min_nonzero_frac: float = 0.01,
+):
+    rng = random.Random(seed)
+    patients = pd.read_csv(patients_csv)
+    patients = patients[patients["Aneurysm Present"] == 0]
+    rows = []
+    
+    with h5py.File(h5_path, "r") as handle: 
+        series_group = handle["series"]
+        for sid in patients["SeriesInstanceUID"]:
+            if sid not in series_group:
+                print(f"[Warning] Series {sid} missing in H5, skipping.")
+                continue
+            vol_np = np.asarray(series_group[sid]["vol"][:])
+            shape = vol_np.shape  # (D, H, W)
+            if any(dim < patch_size for dim in shape):
+                print(f"[Warning] Series {sid} too small for patch size {patch_size}, skipping.")
+                continue
+            patches = 0
+            while patches < number_of_patches:
+                centers = [rng.randint(0 + patch_size//2, shape[i] - patch_size//2) for i in range(len(shape))]
+                frac = patch_nonzero_fraction(vol_np, centers, patch_size)
+                if frac < min_nonzero_frac:
+                    low_content_rejections += 1
+                    continue
+                rows.append([
+                        sid,
+                        f"{centers[2]:.3f}",
+                        f"{centers[1]:.3f}",
+                        f"{centers[0]:.3f}",
+                        "", "", "",
+                        "", "", "",
+                        "0",
+                        "background",
+                    ])
+                patches += 1
+    print(len(rows))
+    csv_path = output_dir / "train_patches.csv"
+    with csv_path.open("a", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "series_id",
+            "center_x",
+            "center_y",
+            "center_z",
+            "aneurysm_x",
+            "aneurysm_y",
+            "aneurysm_z",
+            "aneurysm_rel_x",
+            "aneurysm_rel_y",
+            "aneurysm_rel_z",
+            "label",
+            "location",
+        ])
+        writer.writerows(rows)
+
 
 def main() -> None:
     params = HYPERPARAMS
@@ -398,6 +464,14 @@ def main() -> None:
         seed=int(params["seed"]),
     )
 
+    generate_healthy_patients_patches(
+        h5_path=Path(params["h5"]),
+        patients_csv=Path(params["patients_csv"]),
+        output_dir=Path(params["output_dir"]),
+        patch_size=int(params["patch_size"]),
+        number_of_patches = int(params["number_of_patches_healthy"]),
+        seed=int(params["seed"])
+    )
 
 if __name__ == "__main__":
     main()

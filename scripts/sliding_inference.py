@@ -23,6 +23,8 @@ Run:
 """
 
 from __future__ import annotations
+import warnings
+warnings.simplefilter(action='ignore', category=FutureWarning)
 
 import json
 from dataclasses import asdict, dataclass
@@ -32,7 +34,12 @@ from typing import Dict, Tuple, List, Sequence
 import csv
 import h5py
 import numpy as np
+import pandas as pd
 import torch
+from tqdm import tqdm
+
+from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
+import matplotlib.pyplot as plt
 
 import sys
 sys.path.append(str(Path(__file__).resolve().parents[1] / "src"))
@@ -40,13 +47,12 @@ from model.unet import UNet  # noqa: E402
 
 
 HYPERPARAMS: Dict[str, object] = {
-    "h5_path": Path("h5-aneurysm.h5"),
-    "series_id": "1.2.826.0.1.3680043.8.498.10633029764731181926825032640422192656",
-    "checkpoint": Path("cloud_models/MihaiB-dev/gaussian-3d-u-net_001/MihaiB-dev_gaussian-3d-u-net_001.pt"),
-    "localizers": Path("train_localizers.csv"),  # optional; builds GT sphere mask
-    "radius": 15.0,  # sphere radius for GT mask
+    "h5_path": Path("src/train_dataset.h5"),
+    "checkpoint": Path("cloud_models/MihaiB-dev/suppression-loss_002/MihaiB-dev_suppression-loss_002.pt"),
+    "localizers": None,  # optional; builds GT sphere mask
+    "radius": 5.0,  # sphere radius for GT mask
     # Optional: path to hyperparameters.json (will use its "unet" block if present)
-    "hyperparams_json":  Path("cloud_models/MihaiB-dev/gaussian-3d-u-net_001/hyperparameters.json"),
+    "hyperparams_json":  Path("cloud_models/MihaiB-dev/suppression-loss_002/hyperparameters.json"),
     # Optional: override UNet args directly to match training checkpoint
     "unet_kwargs": {
         # e.g., "start_filters": 16, "out_channels": 1, "normalization": "group8"
@@ -55,11 +61,9 @@ HYPERPARAMS: Dict[str, object] = {
     "stride": 24,
     "threshold": 0.5,
     "device": "cuda" if torch.cuda.is_available() else "cpu",
-    "output_prefix": Path("runs/gaussian-3d-u-net_001"),
+    "output_prefix": Path("runs/random_shit"),
     "use_mixed_precision": False,
     "save_nifti": True,
-    "blend_mode": "gaussian",  # one of {"hann", "gaussian", "naive"}
-    "gaussian_sigma": None,  # if None, defaults to patch_size / 6
 }
 
 
@@ -124,43 +128,16 @@ def make_sphere_mask(shape: Sequence[int], center: Sequence[float], radius: floa
     return (dist2 <= radius**2).astype(np.uint8)
 
 
-def build_weight_mask(patch_size: int, mode: str = "hann", sigma: float | None = None) -> np.ndarray:
-    """Return a 3D weighting mask for overlap-add blending."""
-    mode = (mode or "hann").lower()
-    if mode == "naive":
-        return np.ones((patch_size, patch_size, patch_size), dtype=np.float32)
-    if mode == "hann":
-        h = np.hanning(patch_size)
-        mask = h[:, None, None] * h[None, :, None] * h[None, None, :]
-        return mask.astype(np.float32)
-    if mode == "gaussian":
-        if sigma is None:
-            sigma = patch_size / 6.0
-        coords = np.linspace(-(patch_size - 1) / 2.0, (patch_size - 1) / 2.0, patch_size)
-        zz, yy, xx = np.meshgrid(coords, coords, coords, indexing="ij")
-        mask = np.exp(-(xx**2 + yy**2 + zz**2) / (2.0 * sigma * sigma))
-        mask -= mask.min()
-        vmax = mask.max()
-        if vmax > 0:
-            mask /= vmax
-        return mask.astype(np.float32)
-    raise ValueError(f"Unsupported blend_mode '{mode}'. Use 'naive', 'hann', or 'gaussian'.")
-
-
-def run_inference():
+def run_inference(series_id, threshold, device, predicting_with_mask = False):
     p = HYPERPARAMS
-    h5_path = Path(p["h5_path"])
-    series_id = str(p["series_id"])
-    ckpt = Path(p["checkpoint"])
     patch_size = int(p["patch_size"])
     stride = int(p["stride"])
-    threshold = float(p["threshold"])
-    device = torch.device(p["device"])
     out_prefix = Path(p["output_prefix"])
-
+    #Load data
     with h5py.File(h5_path, "r") as f:
         vol = f["series"][series_id]["vol"][:]
     vol = np.asarray(vol, dtype=np.float32)
+    print(vol.shape, vol.mean())
     vol = np.nan_to_num(vol, nan=0.0, posinf=0.0, neginf=0.0)
 
     # Build GT mask from localizers if provided
@@ -170,53 +147,34 @@ def run_inference():
         loc_points = load_localizer_points(Path(loc_path))
         pts = loc_points.get(series_id, [])
         if pts:
-            rad = float(p.get("radius", 15.0))
+            rad = float(p.get("radius", 5.0))
             gt_mask = np.zeros_like(vol, dtype=np.uint8)
             for c in pts:
                 gt_mask |= make_sphere_mask(vol.shape, c, radius=rad)
 
-    # Build UNet with provided kwargs or from hyperparams_json if available
-    unet_kwargs = dict(p.get("unet_kwargs") or {})
-    hp_json = p.get("hyperparams_json")
-    if hp_json:
-        hp_path = Path(hp_json)
-        if hp_path.exists():
-            with hp_path.open() as f:
-                hp_data = json.load(f)
-            if isinstance(hp_data, dict) and "unet" in hp_data:
-                unet_kwargs.update(hp_data["unet"])
-                print(f"[Info] Loaded UNet args from {hp_path}")
-    model = UNet(**unet_kwargs)
-    state = torch.load(ckpt, map_location="cpu")
-    missing, unexpected = model.load_state_dict(state, strict=False)
-    if missing or unexpected:
-        print(f"[Warning] load_state_dict(strict=False). Missing: {missing}, Unexpected: {unexpected}")
-    model.to(device)
-    model.eval()
-
     prob = np.zeros_like(vol, dtype=np.float32)
     counts = np.zeros_like(vol, dtype=np.float32)
-    weight_mask = build_weight_mask(
-        patch_size,
-        mode=p.get("blend_mode", "hann"),
-        sigma=p.get("gaussian_sigma"),
-    )
 
     use_amp = bool(p.get("use_mixed_precision", False) and device.type == "cuda")
-
+    final_class_output = False
     with torch.no_grad():
         for patch_np, (z, y, x) in sliding_window(vol, patch_size=patch_size, stride=stride):
             patch_t = torch.from_numpy(patch_np).unsqueeze(0).unsqueeze(0).to(device=device, dtype=torch.float32)
             if use_amp:
                 with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
-                    seg_logits, _ = model(patch_t)
+                    seg_logits, class_output = model(patch_t)
             else:
-                seg_logits, _ = model(patch_t)
+                seg_logits, class_output = model(patch_t)
+            class_output = torch.sigmoid(class_output)
+            sig = class_output
+            class_output = (class_output >= threshold)
+            #print(class_output, sig)
+            final_class_output = final_class_output or class_output
             seg_probs = torch.sigmoid(seg_logits.float()).cpu().numpy()[0, 0]
-            prob[z : z + patch_size, y : y + patch_size, x : x + patch_size] += seg_probs * weight_mask
-            counts[z : z + patch_size, y : y + patch_size, x : x + patch_size] += weight_mask
+            prob[z : z + patch_size, y : y + patch_size, x : x + patch_size] += seg_probs
+            counts[z : z + patch_size, y : y + patch_size, x : x + patch_size] += 1.0
 
-    counts[counts == 0] = 1.0
+    counts[counts == 0] = 1.0   
     prob /= counts
     mask = (prob >= threshold).astype(np.uint8)
 
@@ -229,7 +187,7 @@ def run_inference():
         stride=stride,
         threshold=threshold,
         device=str(device),
-        radius=float(p.get("radius", 15.0)),
+        radius=float(p.get("radius", 5.0)),
         localizers=str(loc_path) if loc_path else "",
     )
     np.savez_compressed(
@@ -249,11 +207,63 @@ def run_inference():
             nib.save(nib.Nifti1Image(vol.astype(np.float32), affine), out_prefix.with_suffix(".vol.nii.gz"))
             if gt_mask is not None:
                 nib.save(nib.Nifti1Image(gt_mask.astype(np.uint8), affine), out_prefix.with_suffix(".gtmask.nii.gz"))
-            print(f"[Done] Saved NIfTI volumes to {out_prefix}.prob.nii.gz / .mask.nii.gz / .vol.nii.gz")
+            #print(f"[Done] Saved NIfTI volumes to {out_prefix}.prob.nii.gz / .mask.nii.gz / .vol.nii.gz")
         except ImportError:
-            print("[Warning] nibabel not installed; skipping NIfTI export.")
-    print(f"[Done] Saved {out_prefix.with_suffix('.npz')}, prob mean {prob.mean():.4f}, mask sum {mask.sum()}")
+            pass
+            #print("[Warning] nibabel not installed; skipping NIfTI export.")
+    #print(f"[Done] Saved {out_prefix.with_suffix('.npz')}, prob mean {prob.mean():.4f}, mask sum {mask.sum()}")
+    if predicting_with_mask:
+        return mask.max()
+    else:
+        print(final_class_output)
+        exit()
+        return int(final_class_output)
 
 
 if __name__ == "__main__":
-    run_inference()
+    threshold = float(HYPERPARAMS["threshold"])
+    h5_path = Path(HYPERPARAMS["h5_path"])
+    ckpt = Path(HYPERPARAMS["checkpoint"])
+    unet_kwargs = dict(HYPERPARAMS.get("unet_kwargs") or {})
+    hp_json = HYPERPARAMS.get("hyperparams_json")
+    device = torch.device(HYPERPARAMS["device"])
+
+    
+    train_df = pd.read_csv("ct_preprocessed/train.csv")
+    
+    #Load model
+    # Build UNet with provided kwargs or from hyperparams_json if available
+    if hp_json:
+        hp_path = Path(hp_json)
+        if hp_path.exists():
+            with hp_path.open() as f:
+                hp_data = json.load(f)
+            if isinstance(hp_data, dict) and "unet" in hp_data:
+                unet_kwargs.update(hp_data["unet"])
+                print(f"[Info] Loaded UNet args from {hp_path}")
+    model = UNet(**unet_kwargs)
+    state = torch.load(ckpt, map_location="cpu")
+    missing, unexpected = model.load_state_dict(state, strict=False)
+    if missing or unexpected:
+        print(f"[Warning] load_state_dict(strict=False). Missing: {missing}, Unexpected: {unexpected}")
+    model.to(device)
+    model.eval()
+
+    predictions = []
+    labels = []
+    train_df = train_df.sample(frac=1).reset_index(drop=True)
+    for index, row in tqdm(train_df[["SeriesInstanceUID", "Aneurysm Present"]].iloc[:10].iterrows()):
+        x = row[0]
+        print(x)
+        y = row[1]
+        print("Ground truth:", y)
+        prediction = run_inference(x, threshold, device)
+        
+        predictions.append(prediction)
+        labels.append(y)
+
+    cm = confusion_matrix(labels, predictions)
+    ConfusionMatrixDisplay(cm).plot()
+    plt.savefig("confusion_matrix_higher_threshold.png")
+#1.2.826.0.1.3680043.8.498.82300188681258136694033841609727559375
+#1.2.826.0.1.3680043.8.498.98763049464685085039537379330934967318

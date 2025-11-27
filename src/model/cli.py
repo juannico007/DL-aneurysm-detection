@@ -57,14 +57,14 @@ HYPERPARAMS = {
     
     "train_ratio": 0.7,
     "lr_reduction_epochs": 4,
-    "radius": 15,
+    "radius": 5,
     "unet": {
         "in_channels": 1,
         "out_channels": 1,
         "n_blocks": 4,
         "start_filters": 16,
         "activation": "relu",
-        "normalization": "group4",
+        "normalization": "batch",
         "conv_mode": "same",
         "up_mode": "transposed",
         "middle_neurons": 256,
