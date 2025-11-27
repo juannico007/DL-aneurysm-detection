@@ -42,7 +42,7 @@ class DiceLoss(nn.Module):
 
 class DiceSemimetricLoss(nn.Module):
     """
-    JML2-style Dice semimetric loss that supports soft labels.
+    DML2-style Dice semimetric loss that supports soft labels.
     For hard labels this matches classic soft Dice; for soft labels it keeps the optimum at x=y.
     """
     def __init__(self, eps: float = 1e-6, clip_threshold: float = 0.0, sharp_power: float = 1.0):
@@ -67,29 +67,42 @@ class DiceSemimetricLoss(nn.Module):
 
         intersection = (probs * targets).sum(dim=(2, 3, 4))
         sym_diff = (probs - targets).abs().sum(dim=(2, 3, 4))
-        loss = 1.0 - (intersection + self.eps) / (intersection + sym_diff + self.eps)
+        loss = 1.0 - (2 * intersection + self.eps) / (2 * intersection + sym_diff + self.eps) # DML-2
         return loss.mean()
     
 class SegmentationClassificationLoss(nn.Module):
     """
-    Class for dice loss with bce for classification
-    Parameters:
-        seg_weight: weight for segmentation loss
-        cls_weight: weight for classification loss
-        segmentation: Function to evaluate the segmentation loss
-        classification: Function to evaluate the classification loss
-    Returns: 
-        Loss value for the patient
+    Dice-style segmentation loss + BCE classification loss, with optional suppression of spurious activations.
     """
-    def __init__(self, segmentation = DiceLoss, classification = nn.BCEWithLogitsLoss, seg_weight: float = 0.5, cls_weight: float = 0.5, neg_mean_lambda: float = 0.0, neg_max_lambda: float = 0.0, size_average=True):
+    def __init__(
+        self,
+        segmentation = DiceLoss,
+        classification = nn.BCEWithLogitsLoss,
+        seg_weight: float = 0.5,
+        cls_weight: float = 0.5,
+        suppress_weight: float = 0.0,
+        suppress_tau: float = 0.5,
+        suppress_alpha: float = 2.0,
+        suppress_eps: float = 1e-3,
+        size_average=True,
+    ):
         super(SegmentationClassificationLoss, self).__init__()
         self.seg_weight = seg_weight
         self.cls_weight = cls_weight
-        print("weights:", {"seg": self.seg_weight, "cls": self.cls_weight, "neg_mean": neg_mean_lambda, "neg_max": neg_max_lambda})
+        self.suppress_weight = suppress_weight
+        self.suppress_tau = suppress_tau
+        self.suppress_alpha = suppress_alpha
+        self.suppress_eps = suppress_eps
+        print(
+            "weights:",
+            {
+                "seg": self.seg_weight,
+                "cls": self.cls_weight,
+                "suppress": self.suppress_weight,
+            },
+        )
         self.segmentation = segmentation
         self.classification = classification
-        self.neg_mean_lambda = float(neg_mean_lambda)
-        self.neg_max_lambda = float(neg_max_lambda)
 
     def forward(self, inputs, targets, device):
         #Divide inputs and targets for dice loss and bce
@@ -99,21 +112,18 @@ class SegmentationClassificationLoss(nn.Module):
         classification_target = targets[1]
         classification_input = classification_input.to(device=device, dtype=torch.float32) 
         classification_target = classification_target.to(device=device, dtype=torch.float32) 
-        #print("IN LOSS - seg_in.dtype, device, requires_grad:", segmentation_input.dtype, segmentation_input.device, segmentation_input.requires_grad)
-        #print("IN LOSS - cls_in.dtype, device, requires_grad:", classification_input.dtype, classification_input.device, classification_input.requires_grad)
         
         segmentation_loss = self._segmentation_loss(segmentation_input, segmentation_target)
 
-        # Penalize segmentation probabilities on negative patients to suppress false positives
-        if self.neg_mean_lambda > 0 or self.neg_max_lambda > 0:
+        # Unified suppression on low-target regions (vectorized)
+        if self.suppress_weight > 0:
             probs = torch.sigmoid(segmentation_input).to(dtype=torch.float32)
-            neg_mask = (classification_target.squeeze(1) <= 0.5)
-            if neg_mask.any():
-                neg_probs = probs[neg_mask]
-                if self.neg_mean_lambda > 0:
-                    segmentation_loss = segmentation_loss + self.neg_mean_lambda * neg_probs.mean()
-                if self.neg_max_lambda > 0:
-                    segmentation_loss = segmentation_loss + self.neg_max_lambda * neg_probs.max()
+            targets = segmentation_target.to(dtype=torch.float32)
+            bg_mask = (targets <= self.suppress_eps).float()
+            if bg_mask.any():
+                excess = torch.relu(probs - self.suppress_tau) ** self.suppress_alpha
+                suppression = (excess * bg_mask).sum() / (bg_mask.sum() + self.suppress_eps)
+                segmentation_loss = segmentation_loss + self.suppress_weight * suppression
 
         if self.cls_weight != 0:
             classification_loss = self.classification(classification_input, classification_target)
@@ -123,7 +133,7 @@ class SegmentationClassificationLoss(nn.Module):
     def _segmentation_loss(self, inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
         """Compute segmentation loss using the provided segmentation criterion (supports soft labels)."""
         return self.segmentation(inputs, targets)
-    
+
 def custom_collate(batch):
     data = [item[0] for item in batch]
     target = [item[1] for item in batch]
@@ -172,23 +182,32 @@ def make_sphere_mask(shape, center, radius=5.0):
     mask = dist <= radius**2
     return mask.astype(np.uint8)
 
-def _gaussian_heatmap(shape: Tuple[int, int, int], center: Tuple[float, float, float], sigma: float) -> np.ndarray:
+def _gaussian_heatmap(
+        shape: Tuple[int, int, int], 
+        center: Tuple[float, float, float], 
+        sigma: float, 
+        tau_gauss: float = None) -> np.ndarray:
     """Create a single 3D Gaussian heatmap with peak 1.0."""
     z, y, x = np.ogrid[:shape[0], :shape[1], :shape[2]]
     cz, cy, cx = center
     dist2 = np.square(x - cx)+ np.square(y - cy) + np.square(z - cz)
     heatmap = np.exp(-dist2 / (2.0 * sigma ** 2))
-    peak = heatmap.max()
-    if peak > 0:
-        heatmap = heatmap / peak
+    
+    if tau_gauss is not None:
+        heatmap = np.where(heatmap >= tau_gauss, heatmap, 0.0)
+
     return heatmap.astype(np.float32)
 
 
-def make_heatmaps(shape: Tuple[int, int, int], center: Tuple[float, float, float], sigmas: Sequence[float]) -> np.ndarray:
+def make_heatmaps(
+        shape: Tuple[int, int, int], 
+        center: Tuple[float, float, float], 
+        sigmas: Sequence[float],
+        tau_gauss: float = None) -> np.ndarray:
     """Return stacked 3D Gaussian heatmaps for each sigma."""
     if not sigmas:
         return np.zeros((1,) + tuple(shape), dtype=np.float32)
-    heatmaps = [_gaussian_heatmap(shape, center, sigma) for sigma in sigmas]
+    heatmaps = [_gaussian_heatmap(shape, center, sigma, tau_gauss=tau_gauss) for sigma in sigmas]
     return np.stack(heatmaps, axis=0)
 
 
@@ -207,96 +226,98 @@ class PatchRecord:
     aneurysm_rel_z: Optional[float] = None
     location: str = "background"
 
-class AneurysmDataset(Dataset):
-    """Lightweight dataset that fetches volumes (and optional masks) from HDF5 on demand."""
+# class AneurysmDataset(Dataset):
+#     """Lightweight dataset that fetches volumes (and optional masks) from HDF5 on demand."""
 
-    def __init__(
-        self,
-        h5_path: Path,
-        series_ids: Sequence[str],
-        labels: Sequence[int],
-        transform=None,
-        localizer_csv: Optional[Path] = None,
-        radius: float = 5.0,
-        heatmap_sizes: Sequence[float] = (15.0,),
-    ):
-        self.h5_path = str(h5_path)
-        self.series_ids = list(series_ids)
-        self.labels = [int(label) for label in labels]
-        self.transform = transform
-        self.radius = radius
-        self.heatmap_sizes = list(heatmap_sizes) if heatmap_sizes else [radius]
-        self.localizer_points = self._load_localizer_points(localizer_csv)
-        self._h5 = None
+#     def __init__(
+#         self,
+#         h5_path: Path,
+#         series_ids: Sequence[str],
+#         labels: Sequence[int],
+#         transform=None,
+#         localizer_csv: Optional[Path] = None,
+#         radius: float = 5.0,
+#         heatmap_sizes: Sequence[float] = (15.0,),
+#         suppress_tau: float = 0.3,
+#     ):
+#         self.h5_path = str(h5_path)
+#         self.series_ids = list(series_ids)
+#         self.labels = [int(label) for label in labels]
+#         self.transform = transform
+#         self.radius = radius
+#         self.heatmap_sizes = list(heatmap_sizes) if heatmap_sizes else [radius]
+#         self.localizer_points = self._load_localizer_points(localizer_csv)
+#         self._h5 = None
+#         self.suppress_tau = suppress_tau
 
-    def __len__(self):
-        return len(self.series_ids)
+#     def __len__(self):
+#         return len(self.series_ids)
 
-    def _get_file(self):
-        if self._h5 is None:
-            self._h5 = h5py.File(self.h5_path, "r")
-        return self._h5
+#     def _get_file(self):
+#         if self._h5 is None:
+#             self._h5 = h5py.File(self.h5_path, "r")
+#         return self._h5
 
-    def close(self):
-        if self._h5 is not None:
-            self._h5.close()
-            self._h5 = None
+#     def close(self):
+#         if self._h5 is not None:
+#             self._h5.close()
+#             self._h5 = None
 
-    def __del__(self):
-        self.close()
+#     def __del__(self):
+#         self.close()
 
-    # returns a dict mapping SeriesInstanceUID to np.ndarray of shape (N, 3) with (z_new,y_new,x_new) points
-    def _load_localizer_points(self, csv_path: Optional[Path]) -> Dict[str, np.ndarray]:
-        if not csv_path:
-            return {}
-        csv_path = Path(csv_path).expanduser()
-        if not csv_path.exists():
-            print(f"[Warning] Localizer CSV not found: {csv_path}. Masks disabled.")
-            return {}
-        df = pd.read_csv(csv_path)
-        required = {"SeriesInstanceUID", "x_new", "y_new", "z_new"}
-        if not required.issubset(df.columns):
-            print(
-                "[Warning] Localizer CSV missing required columns "
-                f"({', '.join(sorted(required))}). Masks disabled."
-            )
-            return {}
-        grouped = {}
-        for uid, group in df.groupby("SeriesInstanceUID"):
-            grouped[str(uid)] = group[["z_new", "y_new", "x_new"]].to_numpy(dtype=float)
-        return grouped
+#     # returns a dict mapping SeriesInstanceUID to np.ndarray of shape (N, 3) with (z_new,y_new,x_new) points
+#     def _load_localizer_points(self, csv_path: Optional[Path]) -> Dict[str, np.ndarray]:
+#         if not csv_path:
+#             return {}
+#         csv_path = Path(csv_path).expanduser()
+#         if not csv_path.exists():
+#             print(f"[Warning] Localizer CSV not found: {csv_path}. Masks disabled.")
+#             return {}
+#         df = pd.read_csv(csv_path)
+#         required = {"SeriesInstanceUID", "x_new", "y_new", "z_new"}
+#         if not required.issubset(df.columns):
+#             print(
+#                 "[Warning] Localizer CSV missing required columns "
+#                 f"({', '.join(sorted(required))}). Masks disabled."
+#             )
+#             return {}
+#         grouped = {}
+#         for uid, group in df.groupby("SeriesInstanceUID"):
+#             grouped[str(uid)] = group[["z_new", "y_new", "x_new"]].to_numpy(dtype=float)
+#         return grouped
 
-    def _build_mask(self, pid: str, shape: Tuple[int, int, int]) -> torch.Tensor:
-        mask_np = np.zeros((len(self.heatmap_sizes),) + shape, dtype=np.float32)
-        centers = self.localizer_points.get(str(pid))
-        if centers is not None:
-            for center in centers:
-                heatmaps = make_heatmaps(shape, center, sigmas=self.heatmap_sizes)
-                mask_np = np.maximum(mask_np, heatmaps)
-        return torch.from_numpy(mask_np)
+#     def _build_mask(self, pid: str, shape: Tuple[int, int, int]) -> torch.Tensor:
+#         mask_np = np.zeros((len(self.heatmap_sizes),) + shape, dtype=np.float32)
+#         centers = self.localizer_points.get(str(pid))
+#         if centers is not None:
+#             for center in centers:
+#                 heatmaps = make_heatmaps(shape, center, sigmas=self.heatmap_sizes, tau_gauss=self.suppress_tau)
+#                 mask_np = np.maximum(mask_np, heatmaps)
+#         return torch.from_numpy(mask_np)
 
-    @staticmethod
-    def _empty_mask(shape: Tuple[int, int, int], channels: int = 1) -> torch.Tensor:
-        return torch.zeros((channels,) + tuple(shape), dtype=torch.float32)
+#     @staticmethod
+#     def _empty_mask(shape: Tuple[int, int, int], channels: int = 1) -> torch.Tensor:
+#         return torch.zeros((channels,) + tuple(shape), dtype=torch.float32)
 
-    def __getitem__(self, idx):
-        handle = self._get_file()
-        pid = self.series_ids[idx]
-        group = handle["series"][pid]
-        volume = torch.from_numpy(group["vol"][:])
-        centers = self.localizer_points.get(str(pid))
-        if centers is not None and len(centers):
-            mask = self._build_mask(pid, volume.shape[-3:])
-        else:
-            mask = self._empty_mask(volume.shape[-3:], channels=len(self.heatmap_sizes))
+#     def __getitem__(self, idx):
+#         handle = self._get_file()
+#         pid = self.series_ids[idx]
+#         group = handle["series"][pid]
+#         volume = torch.from_numpy(group["vol"][:])
+#         centers = self.localizer_points.get(str(pid))
+#         if centers is not None and len(centers):
+#             mask = self._build_mask(pid, volume.shape[-3:])
+#         else:
+#             mask = self._empty_mask(volume.shape[-3:], channels=len(self.heatmap_sizes))
 
-        if self.transform:
-            volume = self.transform(volume)
-        elif volume.ndim == 3:
-            volume = volume.unsqueeze(0)
+#         if self.transform:
+#             volume = self.transform(volume)
+#         elif volume.ndim == 3:
+#             volume = volume.unsqueeze(0)
 
-        label = self.labels[idx]
-        return volume, mask, label
+#         label = self.labels[idx]
+#         return volume, mask, label
 
 
 def _safe_float(value: str) -> Optional[float]:
@@ -318,7 +339,12 @@ def load_patch_records(patch_csv: Path) -> List[PatchRecord]:
         if missing:
             raise ValueError(f"Patches CSV missing columns: {', '.join(sorted(missing))}")
         for row in reader:
-            label = int(row["label"])
+            try:
+                label = int(row["label"])
+            except (TypeError, ValueError):
+                # Skip rows that look like headers or malformed entries
+                print(f"[Warning] Skipping malformed row in patches CSV: {row}")
+                continue
             records.append(
                 PatchRecord(
                     series_id=row["series_id"],
@@ -349,6 +375,7 @@ class PatchAneurysmDataset(Dataset):
         transform=None,
         radius: float = 5.0,
         heatmap_sizes: Sequence[float] = (15.0,),
+        suppress_tau: float = 0.3,
     ):
         self.h5_path = str(h5_path)
         self.records = records
@@ -357,6 +384,7 @@ class PatchAneurysmDataset(Dataset):
         self.radius = radius
         self.heatmap_sizes = list(heatmap_sizes) if heatmap_sizes else [radius]
         self._h5 = None
+        self.suppress_tau = suppress_tau
 
     def __len__(self):
         return len(self.records)
@@ -410,7 +438,7 @@ class PatchAneurysmDataset(Dataset):
                 )
             else:
                 center = (self.patch_size / 2.0, self.patch_size / 2.0, self.patch_size / 2.0)
-            mask_np = make_heatmaps(patch_np.shape, center, sigmas=self.heatmap_sizes)
+            mask_np = make_heatmaps(patch_np.shape, center, sigmas=self.heatmap_sizes, tau_gauss=self.suppress_tau)
 
         volume = torch.from_numpy(patch_np)
         mask = torch.from_numpy(mask_np)
@@ -495,10 +523,11 @@ class TrainingPipeline:
         lw = loss_weights or {}
         self.seg_weight = float(lw.get("segmentation", 0.7))
         self.cls_weight = float(lw.get("classification", 0.3))
-        self.base_neg_mean_lambda = float(lw.get("neg_mean", 0.1))
-        self.base_neg_max_lambda = float(lw.get("neg_max", 0.05))
-        self.neg_mean_lambda = self.base_neg_mean_lambda
-        self.neg_max_lambda = self.base_neg_max_lambda
+        self.base_suppress_weight = float(lw.get("suppress", lw.get("neg_mean", 0.0)))
+        self.suppress_tau = float(lw.get("suppress_tau", 0.3))
+        self.suppress_alpha = float(lw.get("suppress_alpha", 2.0))
+        self.suppress_eps = float(lw.get("suppress_eps", 1e-3))
+        self.suppress_weight = self.base_suppress_weight
         self.neg_warmup_epochs = int(neg_warmup_epochs)
         self.neg_ramp_epochs = max(1, self.epochs - self.neg_warmup_epochs)
 
@@ -547,11 +576,9 @@ class TrainingPipeline:
     def _update_neg_lambdas(self, epoch: int):
         """Update neg penalty lambdas according to ramp schedule."""
         scale = self._neg_penalty_scale(epoch)
-        self.neg_mean_lambda = self.base_neg_mean_lambda * scale
-        self.neg_max_lambda = self.base_neg_max_lambda * scale
+        self.suppress_weight = self.base_suppress_weight * scale
         if hasattr(self, "criterion"):
-            self.criterion.neg_mean_lambda = self.neg_mean_lambda
-            self.criterion.neg_max_lambda = self.neg_max_lambda
+            self.criterion.suppress_weight = self.suppress_weight
 
     def create_dataloaders(
         self,
@@ -608,6 +635,7 @@ class TrainingPipeline:
             transform=train_transforms,
             radius=self.radius,
             heatmap_sizes=self.heatmap_sizes,
+            suppress_tau=self.suppress_tau,
         )
         val_dataset = PatchAneurysmDataset(
             h5_path=h5_path,
@@ -616,6 +644,7 @@ class TrainingPipeline:
             transform=val_transforms,
             radius=self.radius,
             heatmap_sizes=self.heatmap_sizes,
+            suppress_tau=self.suppress_tau,
         )
 
         train_loader = DataLoader(
@@ -761,8 +790,10 @@ class TrainingPipeline:
             self.classification_loss,
             seg_weight=self.seg_weight,
             cls_weight=self.cls_weight,
-            neg_mean_lambda=self.neg_mean_lambda,
-            neg_max_lambda=self.neg_max_lambda,
+            suppress_weight=self.suppress_weight,
+            suppress_tau=self.suppress_tau,
+            suppress_alpha=self.suppress_alpha,
+            suppress_eps=self.suppress_eps,
         )
         self.model, self.optimizer = self.accelerator.prepare(self.model, self.optimizer)
         self._configure_scheduler()
@@ -847,7 +878,7 @@ class TrainingPipeline:
 
                     # Binary core dice: threshold target and prediction
                     if targets_pos is not None:
-                        tgt_bin = (targets_pos >= 0.1).float()
+                        tgt_bin = (targets_pos >= 0.05).float()
                         pred_bin = (mask_probs_pos >= 0.5).float()
                         pred_bsum = pred_bin.sum(dim=(1, 2, 3, 4))
                         tgt_bsum = tgt_bin.sum(dim=(1, 2, 3, 4))

@@ -288,7 +288,7 @@ class UpBlock(nn.Module):
         normalization: str = 'batch',
         conv_mode: str = 'same',
         up_mode: str = 'transposed',
-        attention: bool = False
+        attention: bool = True
     ):
         super().__init__()
 

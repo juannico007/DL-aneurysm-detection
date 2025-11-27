@@ -13,12 +13,12 @@ MODE_ENV_VAR = "TRAINING_MODE"
 
 HYPERPARAMS = {
     "data_dir": "train_dataset.h5",
-    "patch_csv": "patches/patches.csv",
-    "proportion_to_use": 1.0,
+    "patch_csv": "train_patches.csv",
+    "proportion_to_use": 0.1,
     "input_shape": (256, 256, 256),
     "batch_size": 20,
     "grad_accum": 2,
-    "epochs": 40,
+    "epochs": 5,
     "learning_rate": 1e-4,
     "weight_decay": 1e-2,
     # "scheduler": {
@@ -28,12 +28,14 @@ HYPERPARAMS = {
     # },
     "max_voxels": 500 * 500 * 500,
     "loss_weights": {
-        "segmentation": 0.9,
-        "classification": 0.1,
-        "neg_mean": 0.1,
-        "neg_max": 0.05,
+        "segmentation": 0.7,
+        "classification": 0.3,
+        "suppress": 0.1,
+        "suppress_tau": 0.3,
+        "suppress_alpha": 2.0,
+        "suppress_eps": 1e-3,
     },
-    "neg_warmup_epochs": 15,
+    "neg_warmup_epochs": 0,
     "heatmap_sigma": 15,
     "heatmap_decay_epoch": 50,
     # "scheduler":{
