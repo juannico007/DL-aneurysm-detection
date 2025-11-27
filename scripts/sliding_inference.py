@@ -230,7 +230,6 @@ if __name__ == "__main__":
 
     
     train_df = pd.read_csv("ct_preprocessed/train.csv")
-    series_id = train_df["SeriesInstanceUID"].iloc[0]
     
     #Load model
     # Build UNet with provided kwargs or from hyperparams_json if available
@@ -258,7 +257,7 @@ if __name__ == "__main__":
         print(x)
         y = row[1]
         print("Ground truth:", y)
-        prediction = run_inference(series_id, threshold, device)
+        prediction = run_inference(x, threshold, device)
         
         predictions.append(prediction)
         labels.append(y)
