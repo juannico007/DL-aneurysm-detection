@@ -2,7 +2,7 @@ base_job_name: accelerate-sagemaker-1
 compute_environment: AMAZON_SAGEMAKER
 debug: true
 distributed_type: 'NO'
-ec2_instance_type: ml.g5.4xlarge
+ec2_instance_type: ml.g5.2xlarge
 enable_cpu_affinity: false
 gpu_ids: all
 iam_role_name: arn:aws:iam::393847600789:role/service-role/AmazonSageMaker-ExecutionRole-20251111T190751

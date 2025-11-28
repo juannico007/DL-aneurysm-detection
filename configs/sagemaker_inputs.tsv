@@ -1,2 +1,2 @@
 channel_name	data_location
-train	s3://sagemaker-eu-north-1-393847600789/train
+train	s3://sagemaker-eu-north-1-393847600789/train/

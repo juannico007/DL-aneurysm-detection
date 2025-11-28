@@ -14,13 +14,13 @@ MODE_ENV_VAR = "TRAINING_MODE"
 HYPERPARAMS = {
     "data_dir": "train_dataset.h5",
     "patch_csv": "train_patches.csv",
-    "proportion_to_use": 0.1,
+    "proportion_to_use": 1.0,
     "input_shape": (256, 256, 256),
     "batch_size": 20,
     "grad_accum": 2,
-    "epochs": 5,
-    "learning_rate": 1e-4,
-    "weight_decay": 1e-2,
+    "epochs": 40,
+    "learning_rate": 1e-3,
+    "weight_decay": 1e-3,
     # "scheduler": {
     #     "name": "step",
     #     "step_size": 100,
@@ -28,16 +28,31 @@ HYPERPARAMS = {
     # },
     "max_voxels": 500 * 500 * 500,
     "loss_weights": {
-        "segmentation": 0.7,
-        "classification": 0.3,
-        "suppress": 0.1,
-        "suppress_tau": 0.3,
-        "suppress_alpha": 2.0,
+        "segmentation": 0.8,
+        "classification": 0.2,
+        "suppress": 0.15,
+        "suppress_tau": 0.1,
+        "suppress_alpha": 3.0,
         "suppress_eps": 1e-3,
     },
-    "neg_warmup_epochs": 0,
-    "heatmap_sigma": 15,
-    "heatmap_decay_epoch": 50,
+    "neg_warmup_epochs": 5,
+    "heatmap_sigma": 20,
+    # Heatmap decay strategy: {"name": "epoch"|"plateau"|"threshold", ...}
+    "heatmap_decay": {
+        "min_sigma": 5.0,
+        # "name": "epoch",
+        # "epoch": 10,          # used when name == "epoch"
+        # For plateau mode:
+        # "metric": "val_loss",
+        # "mode": "min",      # or "max"
+        # "patience": 3,
+        # "factor": 0.8,
+        # For threshold mode:
+        "metric": "val_peak_err",
+        "mode": "min",
+        "threshold": 12.0,
+        "factor": 0.8,
+    },
     # "scheduler":{
     #     "name" : "cosine",
     #     "eta_min": 1e-6
@@ -47,7 +62,7 @@ HYPERPARAMS = {
         "name": "plateau",
         "mode": "min",
         "factor": 0.5,
-        "patience": 5,
+        "patience": 4,
         "min_lr": 1e-6,
     },
 
@@ -56,7 +71,7 @@ HYPERPARAMS = {
     # },
     
     "train_ratio": 0.7,
-    "lr_reduction_epochs": 4,
+    "lr_reduction_epochs": 10,
     "radius": 5,
     "unet": {
         "in_channels": 1,
@@ -64,12 +79,13 @@ HYPERPARAMS = {
         "n_blocks": 4,
         "start_filters": 16,
         "activation": "relu",
-        "normalization": "batch",
+        "normalization": "group4",
         "conv_mode": "same",
         "up_mode": "transposed",
         "middle_neurons": 256,
         "class_output": 1,
-        "dropout": 0.3,
+        "dropout": 0.1,
+        "attention": True
     },
 }
 
@@ -274,7 +290,7 @@ def main():
         radius=hyperparams["radius"],
         patch_csv=patch_csv,
         heatmap_sigma=hyperparams["heatmap_sigma"],
-        heatmap_decay_epoch=hyperparams.get("heatmap_decay_epoch", 0),
+        heatmap_decay=hyperparams.get("heatmap_decay"),
         patch_size=hyperparams.get("patch_size", 64),
         train_ratio=hyperparams.get("train_ratio", 0.8),
         split_seed=hyperparams.get("split_seed", 42),

@@ -469,7 +469,8 @@ class TrainingPipeline:
         grad_accum_steps: int = 2,
         radius: float = 5.0,
         heatmap_sigma: float = 15.0,
-        heatmap_decay_epoch: int = 0,
+        heatmap_decay: Optional[Dict[str, Any]] = None,
+        heatmap_min_sigma: float = 5.0,
         patch_csv: Optional[Path] = None,
         patch_size: int = 64,
         train_ratio: float = 0.8,
@@ -507,8 +508,11 @@ class TrainingPipeline:
         self.radius = radius
         self.initial_heatmap_sigma = float(heatmap_sigma)
         self.current_heatmap_sigma = float(heatmap_sigma)
-        self.heatmap_min_sigma = 5.0
-        self.heatmap_decay_epoch = int(heatmap_decay_epoch)
+        self.heatmap_min_sigma = float(heatmap_min_sigma)
+        self.heatmap_decay_config = dict(heatmap_decay) if heatmap_decay else {"name": "epoch", "epoch": 0}
+        if "min_sigma" in self.heatmap_decay_config:
+            self.heatmap_min_sigma = float(self.heatmap_decay_config["min_sigma"])
+        self.heatmap_decay_epoch = int(self.heatmap_decay_config.get("epoch", 0))
         self.heatmap_sizes = [self.current_heatmap_sigma]
         self.primary_heatmap_index = 0
         self.patch_csv = Path(patch_csv) if patch_csv else None
@@ -560,10 +564,21 @@ class TrainingPipeline:
 
     def _maybe_decay_heatmap(self, epoch: int):
         """Shrink sigma gradually after the configured epoch, rounded to int."""
-        new_sigma = self._sigma_for_epoch(epoch)
-        if new_sigma != self.current_heatmap_sigma:
-            self.accelerator.print(f"[Heatmap] Sigma update at epoch {epoch}: {self.current_heatmap_sigma} -> {new_sigma}")
-        self._set_heatmap_sigma(new_sigma)
+        cfg = self.heatmap_decay_config
+        name = cfg.get("name", "epoch")
+        if name == "epoch":
+            new_sigma = self._sigma_for_epoch(epoch)
+            if new_sigma != self.current_heatmap_sigma:
+                self.accelerator.print(f"[Heatmap] Sigma update at epoch {epoch}: {self.current_heatmap_sigma} -> {new_sigma}")
+                self._set_heatmap_sigma(new_sigma)
+        elif name == "plateau":
+            # handled in training loop after validation using metrics
+            return
+        elif name == "threshold":
+            # handled in training loop after validation using metrics
+            return
+        else:
+            return
 
     def _neg_penalty_scale(self, epoch: int) -> float:
         """Gaussian ramp from 0 to 1 after warmup for negative suppression terms."""
@@ -579,6 +594,51 @@ class TrainingPipeline:
         self.suppress_weight = self.base_suppress_weight * scale
         if hasattr(self, "criterion"):
             self.criterion.suppress_weight = self.suppress_weight
+
+    def _maybe_decay_heatmap_dynamic(self, metrics: Dict[str, float], epoch: int):
+        cfg = self.heatmap_decay_config
+        name = cfg.get("name", "epoch")
+        if name == "plateau":
+            metric_name = cfg.get("metric", "val_loss")
+            mode = cfg.get("mode", "min")
+            patience = int(cfg.get("patience", 3))
+            factor = float(cfg.get("factor", 0.5))
+            if not hasattr(self, "_hd_best"):
+                self._hd_best = None
+                self._hd_wait = 0
+            current = metrics.get(metric_name)
+            if current is None:
+                return
+            if self._hd_best is None:
+                self._hd_best = current
+                self._hd_wait = 0
+                return
+            improved = (current < self._hd_best) if mode == "min" else (current > self._hd_best)
+            if improved:
+                self._hd_best = current
+                self._hd_wait = 0
+            else:
+                self._hd_wait += 1
+                if self._hd_wait >= patience:
+                    new_sigma = max(self.current_heatmap_sigma * factor, self.heatmap_min_sigma)
+                    if new_sigma < self.current_heatmap_sigma:
+                        self.accelerator.print(f"[Heatmap] Plateau decay at epoch {epoch}: {self.current_heatmap_sigma} -> {new_sigma}")
+                        self._set_heatmap_sigma(new_sigma)
+                    self._hd_wait = 0
+        elif name == "threshold":
+            metric_name = cfg.get("metric", "val_peak_err_series")
+            mode = cfg.get("mode", "min")
+            thresh = float(cfg.get("threshold", 0.0))
+            factor = float(cfg.get("factor", 0.5))
+            current = metrics.get(metric_name)
+            if current is None:
+                return
+            hit = (current <= thresh) if mode == "min" else (current >= thresh)
+            if hit:
+                new_sigma = max(self.current_heatmap_sigma * factor, self.heatmap_min_sigma)
+                if new_sigma < self.current_heatmap_sigma:
+                    self.accelerator.print(f"[Heatmap] Threshold decay at epoch {epoch}: {self.current_heatmap_sigma} -> {new_sigma}")
+                    self._set_heatmap_sigma(new_sigma)
 
     def create_dataloaders(
         self,
@@ -837,9 +897,9 @@ class TrainingPipeline:
                     if self.accelerator.sync_gradients:
                         max_norm = 5
                         unclipped_global_norm = self.accelerator.clip_grad_norm_(self.model.parameters(), max_norm=max_norm)
-                        self.accelerator.print(
-                                f"[GRAD] Max Norm: {max_norm:.2f} | Unclipped Global Norm: {unclipped_global_norm:.4f}"
-                            )
+                        # self.accelerator.print(
+                        #         f"[GRAD] Max Norm: {max_norm:.2f} | Unclipped Global Norm: {unclipped_global_norm:.4f}"
+                        #     )
                     
                         self.optimizer.step()
                         self.optimizer.zero_grad(set_to_none=True)
@@ -1157,17 +1217,33 @@ class TrainingPipeline:
             }
             self.accelerator.log(epoch_metrics, step=epoch)
 
+            unwrapped = self.accelerator.unwrap_model(self.model)
+            # per-epoch checkpoint (optional)
+            ckpt_path = Path(self.checkpoint_path)
+            epoch_ckpt = ckpt_path.with_name(f"{epoch}_{ckpt_path.name}")
+            epoch_ckpt.parent.mkdir(parents=True, exist_ok=True)
+            self.accelerator.save(unwrapped.state_dict(), epoch_ckpt)
             # --- Checkpointing ---
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
                 # unwrap for vanilla state_dict saving
-                unwrapped = self.accelerator.unwrap_model(self.model)
                 # use accelerator.save to be safe in distributed
+                ckpt_path.parent.mkdir(parents=True, exist_ok=True)
                 self.accelerator.save(unwrapped.state_dict(), self.checkpoint_path)
                 self.accelerator.print(f"Validation loss improved: saved to {self.checkpoint_path}")
                 epochs_no_improve = 0
             else:
                 epochs_no_improve += 1
+
+            # Dynamic heatmap decay based on metrics/config
+            self._maybe_decay_heatmap_dynamic(
+                {
+                    "val_loss": val_loss,
+                    "val_core_dice": val_core_dice_mean,
+                    "val_peak_err": val_peak_mean,
+                },
+                epoch,
+            )
 
 
             # --- Early stopping ---

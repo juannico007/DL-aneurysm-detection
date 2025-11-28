@@ -47,12 +47,12 @@ from model.unet import UNet  # noqa: E402
 
 
 HYPERPARAMS: Dict[str, object] = {
-    "h5_path": Path("src/train_dataset.h5"),
-    "checkpoint": Path("cloud_models/MihaiB-dev/suppression-loss_002/MihaiB-dev_suppression-loss_002.pt"),
+    "h5_path": Path("train_dataset.h5"),
+    "checkpoint": Path("cloud_models/MihaiB-dev/suppression-loss_threshold-on-gauss/MihaiB-dev_suppression-loss_threshold-on-gauss.pt"),
     "localizers": None,  # optional; builds GT sphere mask
     "radius": 5.0,  # sphere radius for GT mask
     # Optional: path to hyperparameters.json (will use its "unet" block if present)
-    "hyperparams_json":  Path("cloud_models/MihaiB-dev/suppression-loss_002/hyperparameters.json"),
+    "hyperparams_json":  Path("cloud_models/MihaiB-dev/suppression-loss_threshold-on-gauss/hyperparameters.json"),
     # Optional: override UNet args directly to match training checkpoint
     "unet_kwargs": {
         # e.g., "start_filters": 16, "out_channels": 1, "normalization": "group8"
@@ -229,7 +229,7 @@ if __name__ == "__main__":
     device = torch.device(HYPERPARAMS["device"])
 
     
-    train_df = pd.read_csv("ct_preprocessed/train.csv")
+    train_df = pd.read_csv("train.csv")
     
     #Load model
     # Build UNet with provided kwargs or from hyperparams_json if available
