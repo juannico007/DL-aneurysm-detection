@@ -19,6 +19,37 @@ from dataclasses import dataclass
 import h5py
 import math
 
+class MultiTaskLoss(nn.Module):
+    def __init__(self, tasks: List[str]):
+        super().__init__()
+        self.tasks = tasks
+        self.log_vars = nn.ParameterDict({
+            task: nn.Parameter(torch.zeros(1)) for task in tasks
+        })
+
+    def forward(self, loss_dict: Dict[str, torch.Tensor]):
+        total_loss = 0
+        for task, loss in loss_dict.items():
+            if task not in self.log_vars:
+                continue
+            log_var = self.log_vars[task]
+            precision = torch.exp(-log_var)
+            total_loss += 0.5 * precision * loss + 0.5 * log_var
+        return total_loss
+
+class TrainingWrapper(nn.Module):
+    """
+    Wrapper to bundle the main model and the multi-task loss module 
+    so they can be prepared together by Accelerate/DeepSpeed.
+    """
+    def __init__(self, model, multi_task_loss):
+        super().__init__()
+        self.model = model
+        self.multi_task_loss = multi_task_loss
+    
+    def forward(self, x):
+        return self.model(x)
+
 class UnifiedCurriculumDice(nn.Module):
     def __init__(self, beta=2.0, lambda_tail=1.0, lambda_max=0.0, epsilon=1e-6):
         super().__init__()
@@ -433,7 +464,7 @@ class TrainingPipeline:
         epochs: int = 4,
         learning_rate : float = 1e-4,
         weight_decay: float = 0.01,
-        early_stopping_patience: int = 20,
+        early_stopping_patience: int = 40,
         lr_reduction_patience: int = 10,
         lr_reduction_factor : float = 0.5,
         min_lr : float = 1e-7,
@@ -530,6 +561,15 @@ class TrainingPipeline:
             lambda_max=self.lambda_max
         )
 
+        # Identify active tasks for Multi-Task Learning
+        self.tasks = ["segmentation"]
+        if self.cls_weight > 0:
+            self.tasks.append("classification")
+        if self.coord_weight > 0:
+            self.tasks.append("coordinates")
+        
+        self.multi_task_loss = MultiTaskLoss(self.tasks)
+
     def _sigma_for_epoch(self, epoch: int) -> float:
         """Compute decayed sigma rounded to int, reducing by 1 every `heatmap_decay_epoch` epochs."""
         interval = self.heatmap_decay_epoch
@@ -621,7 +661,7 @@ class TrainingPipeline:
                     new_sigma = max(self.current_heatmap_sigma * factor, self.heatmap_min_sigma)
                     if new_sigma < self.current_heatmap_sigma:
                         self.accelerator.print(f"[Heatmap] Plateau decay at epoch {epoch}: {self.current_heatmap_sigma} -> {new_sigma}")
-                        self._set_heatmap_sigma(new_sigma)
+                        self.current_heatmap_sigma = new_sigma
                     self._hd_wait = 0
         elif name == "threshold":
             metric_name = cfg.get("metric", "val_peak_err_series")
@@ -636,7 +676,7 @@ class TrainingPipeline:
                 new_sigma = max(self.current_heatmap_sigma * factor, self.heatmap_min_sigma)
                 if new_sigma < self.current_heatmap_sigma:
                     self.accelerator.print(f"[Heatmap] Threshold decay at epoch {epoch}: {self.current_heatmap_sigma} -> {new_sigma}")
-                    self._set_heatmap_sigma(new_sigma)
+                    self.current_heatmap_sigma = new_sigma
 
     def compute_background_penalty(self, pred, target, input_volume):
         """
@@ -857,8 +897,11 @@ class TrainingPipeline:
 
         self.device = self.accelerator.device
 
+        # Wrap model and multi_task_loss together for DeepSpeed compatibility
+        self.wrapper = TrainingWrapper(self.model, self.multi_task_loss)
+        
         self.optimizer = bnb.optim.Adam8bit(
-            self.model.parameters(), 
+            self.wrapper.parameters(), 
             lr=self.learning_rate,
             betas = (0.9, 0.999),
             eps=1e-8,
@@ -874,11 +917,16 @@ class TrainingPipeline:
         cls_pos_weight = cls_pos_weight.to(self.device)
         self.classification_loss = nn.BCEWithLogitsLoss(pos_weight=cls_pos_weight)
         
-        self.model, self.optimizer = self.accelerator.prepare(self.model, self.optimizer)
+        self.wrapper, self.optimizer = self.accelerator.prepare(
+            self.wrapper, self.optimizer
+        )
+        # Update references to point to wrapped components
+        self.model = self.wrapper.model
+        self.multi_task_loss = self.wrapper.multi_task_loss
         self._configure_scheduler()
         #Since we have to define our own training loop, we have to keep track
         #of these variables for best model, early stopping and learning rate decrease
-        best_val_loss = 1
+        best_val_loss = float("inf")
         epochs_no_improve = 0
         lr_plateau_counter = 0
 
@@ -893,7 +941,13 @@ class TrainingPipeline:
         for epoch in range(1, self.epochs + 1):
             self._maybe_decay_heatmap(epoch)
             current_alpha = self._get_current_alpha(epoch)
-            self.accelerator.print(f"Epoch {epoch}: Alpha = {current_alpha:.4f}, Sigma = {self.current_heatmap_sigma:.1f}")
+            # Get current MTL weights for display
+            mtl_info = []
+            for task, param in self.multi_task_loss.log_vars.items():
+                weight = torch.exp(-param).item()
+                mtl_info.append(f"{task}={weight:.4f}")
+            mtl_str = ", ".join(mtl_info)
+            self.accelerator.print(f"Epoch {epoch}: Alpha = {current_alpha:.4f}, Sigma = {self.current_heatmap_sigma:.1f}, Weights: [{mtl_str}]")
             
             self.model.train()
             train_losses = []
@@ -901,6 +955,8 @@ class TrainingPipeline:
             train_core_list, train_peak_list, train_focus_list = [], [], []
             all_preds, all_labels = [], []
             train_neg_mean_list, train_neg_max_list = [], []
+            train_seg_losses, train_cls_losses, train_coord_losses = [], [], []
+            train_total_losses = []
             for x_batch, mask_batch, y_batch, coord_batch in tqdm(self.train_loader):
                 x_batch = x_batch.to(self.device, dtype=torch.float16, non_blocking=True)
                 mask_batch = mask_batch.to(self.device, dtype=torch.float16, non_blocking=True)
@@ -935,27 +991,37 @@ class TrainingPipeline:
                             cls_logits = outputs[1]
                             cls_loss = self.classification_loss(cls_logits, y_batch)
                             
-                        loss = self.seg_weight * seg_loss + self.cls_weight * cls_loss
+                        # Background penalty loss
+                        if self.background_weight > 0:
+                            bg_penalty = self.compute_background_penalty(seg_probs, targets, x_batch)
+                            # Treat background penalty as part of segmentation task
+                            seg_loss += self.background_weight * bg_penalty
                         
-                        # Coordinate regression loss
+                        # Combine losses using Multi-Task Uncertainty Weights
+                        loss_dict = {"segmentation": seg_loss}
+                        
+                        if self.cls_weight > 0 and len(outputs) > 1:
+                            loss_dict["classification"] = cls_loss
+                            
                         if self.coord_weight > 0 and len(outputs) > 2:
                             reg_output = outputs[2].float() # Ensure float32
                             # coord_batch is (B, 3)
                             # Calculate MSE loss per sample
                             mse_loss = F.mse_loss(reg_output, coord_batch, reduction='none').mean(dim=1)
                             
+                            # Scale by patch_size to get voxel-scale errors
+                            scaled_mse = self.patch_size * mse_loss
+                            
                             # Masking: Only penalize if label == 1
                             # y_batch is (B, 1)
                             mask = y_batch.squeeze(1)
-                            masked_mse = (mse_loss * mask).sum() / (mask.sum() + 1e-6)
+                            masked_mse = (scaled_mse * mask).sum() / (mask.sum() + 1e-6)
                             
-                            loss += self.coord_weight * masked_mse
-                        
-                        # Background penalty loss
-                        if self.background_weight > 0:
-                            bg_penalty = self.compute_background_penalty(seg_probs, targets, x_batch)
-                            loss += self.background_weight * bg_penalty
-                        
+                            # Use the scaled masked_mse for the coordinate task
+                            loss_dict["coordinates"] = masked_mse
+                            
+                        loss = self.multi_task_loss(loss_dict)
+
                         self.accelerator.backward(loss)
                     if self.accelerator.sync_gradients:
                         max_norm = 5
@@ -969,7 +1035,13 @@ class TrainingPipeline:
                         if self.scheduler and self.scheduler_step_mode == "batch":
                             self.scheduler.step()
 
-                train_losses.append(self.accelerator.gather(loss.detach()).mean().item())
+                # Track individual task losses
+                train_seg_losses.append(self.accelerator.gather(seg_loss.detach()).mean().item())
+                if "classification" in loss_dict:
+                    train_cls_losses.append(self.accelerator.gather(cls_loss.detach()).mean().item())
+                if "coordinates" in loss_dict:
+                    train_coord_losses.append(self.accelerator.gather(masked_mse.detach()).mean().item())
+                train_total_losses.append(self.accelerator.gather(loss.detach()).mean().item())
 
                 #Dice calculation (soft dice on soft targets)
                 with torch.no_grad():
@@ -1092,6 +1164,16 @@ class TrainingPipeline:
             history["train_ppv"].append(train_ppv)
             history["train_npv"].append(train_npv)
             history["train_dice"].append(train_dice_mean)
+            
+            # Track individual task losses (use safe mean to avoid numpy warnings)
+            train_seg_loss_mean = sum(train_seg_losses) / len(train_seg_losses) if train_seg_losses else 0.0
+            train_cls_loss_mean = sum(train_cls_losses) / len(train_cls_losses) if train_cls_losses else 0.0
+            train_coord_loss_mean = sum(train_coord_losses) / len(train_coord_losses) if train_coord_losses else 0.0
+            train_total_loss_mean = sum(train_total_losses) / len(train_total_losses) if train_total_losses else 0.0
+            history.setdefault("train_seg_loss", []).append(train_seg_loss_mean)
+            history.setdefault("train_cls_loss", []).append(train_cls_loss_mean)
+            history.setdefault("train_coord_loss", []).append(train_coord_loss_mean)
+            history.setdefault("train_total_loss", []).append(train_total_loss_mean)
             history.setdefault("train_core_dice_series", []).append(train_core_dice_mean)
             history.setdefault("train_peak_err_series", []).append(train_peak_mean)
             history.setdefault("train_focus_series", []).append(train_focus_mean)
@@ -1108,6 +1190,8 @@ class TrainingPipeline:
                 val_core_list, val_peak_list, val_focus_list = [], [], []
                 val_neg_mean_list, val_neg_max_list = [], []
                 val_dice_scores = []
+                val_seg_losses, val_cls_losses, val_coord_losses = [], [], []
+                val_total_losses = []
                 for x_batch, mask_batch, y_batch, coord_batch in self.val_loader:
                     x_batch = x_batch.to(self.device, dtype=torch.float16, non_blocking=True)
                     mask_batch = mask_batch.to(self.device, dtype=torch.float16, non_blocking=True)
@@ -1132,16 +1216,35 @@ class TrainingPipeline:
                             cls_logits = outputs[1]
                             cls_loss = self.classification_loss(cls_logits, y_batch)
                             
-                        loss = self.seg_weight * seg_loss + self.cls_weight * cls_loss
+                        # Background penalty (for validation consistency)
+                        if self.background_weight > 0:
+                            bg_penalty = self.compute_background_penalty(seg_probs, targets, x_batch)
+                            seg_loss += self.background_weight * bg_penalty
+
+                        loss_dict = {"segmentation": seg_loss}
+                        if self.cls_weight > 0 and len(outputs) > 1:
+                            loss_dict["classification"] = cls_loss
                         
                         if self.coord_weight > 0 and len(outputs) > 2:
                             reg_output = outputs[2].float()
                             mse_loss = F.mse_loss(reg_output, coord_batch, reduction='none').mean(dim=1)
+                            
+                            # Scale by patch_size to get voxel-scale errors
+                            scaled_mse = self.patch_size * mse_loss
+                            
                             mask = y_batch.squeeze(1)
-                            masked_mse = (mse_loss * mask).sum() / (mask.sum() + 1e-6)
-                            loss += self.coord_weight * masked_mse
+                            masked_mse = (scaled_mse * mask).sum() / (mask.sum() + 1e-6)
+                            loss_dict["coordinates"] = masked_mse
+                            
+                        loss = self.multi_task_loss(loss_dict)
                         
-                    val_losses.append(self.accelerator.gather(loss.detach()).mean().item())
+                    # Track individual task losses
+                    val_seg_losses.append(self.accelerator.gather(seg_loss.detach()).mean().item())
+                    if "classification" in loss_dict:
+                        val_cls_losses.append(self.accelerator.gather(cls_loss.detach()).mean().item())
+                    if "coordinates" in loss_dict:
+                        val_coord_losses.append(self.accelerator.gather(masked_mse.detach()).mean().item())
+                    val_total_losses.append(self.accelerator.gather(loss.detach()).mean().item())
 
                     #DICE loss (soft dice on soft targets)
                     mask_probs = torch.sigmoid(outputs[0].detach().to(torch.float32))
@@ -1254,13 +1357,24 @@ class TrainingPipeline:
             val_sens = tp / max(tp + fn, 1)
             val_ppv = tp / max(tp + fp, 1)
             val_npv = tn / max(tn + fn, 1)
-            val_loss = np.mean(val_losses)
+            
+            # Calculate mean task losses (use safe mean to avoid numpy warnings)
+            val_seg_loss_mean = sum(val_seg_losses) / len(val_seg_losses) if val_seg_losses else 0.0
+            val_cls_loss_mean = sum(val_cls_losses) / len(val_cls_losses) if val_cls_losses else 0.0
+            val_coord_loss_mean = sum(val_coord_losses) / len(val_coord_losses) if val_coord_losses else 0.0
+            val_total_loss_mean = sum(val_total_losses) / len(val_total_losses) if val_total_losses else 0.0
+            # Use segmentation loss as primary validation metric
+            val_loss = val_seg_loss_mean
             history["val_loss"].append(val_loss)
             history["val_acc"].append(val_acc)
             history["val_sensitivity"].append(val_sens)
             history["val_ppv"].append(val_ppv)
             history["val_npv"].append(val_npv)
             history["val_dice"].append(val_dice_mean)
+            history.setdefault("val_seg_loss", []).append(val_seg_loss_mean)
+            history.setdefault("val_cls_loss", []).append(val_cls_loss_mean)
+            history.setdefault("val_coord_loss", []).append(val_coord_loss_mean)
+            history.setdefault("val_total_loss", []).append(val_total_loss_mean)
             history.setdefault("val_core_dice_series", []).append(val_core_dice_mean)
             history.setdefault("val_peak_err_series", []).append(val_peak_mean)
             history.setdefault("val_focus_series", []).append(val_focus_mean)
@@ -1268,17 +1382,51 @@ class TrainingPipeline:
             history.setdefault("val_neg_prob_max_series", []).append(val_neg_prob_max)
             history.setdefault("alpha_series", []).append(current_alpha)
             history.setdefault("heatmap_sigma_series", []).append(self.current_heatmap_sigma)
+            
+            # Log Multi-Task Weights (sigma^2 = exp(s))
+            mtl_weights = {}
+            for task, param in self.multi_task_loss.log_vars.items():
+                sigma2 = torch.exp(param).item()
+                weight = 1.0 / sigma2
+                mtl_weights[f"mtl_weight/{task}"] = weight
+                history.setdefault(f"mtl_weight_{task}", []).append(weight)
             if self.accelerator.is_main_process:
+                train_seg_loss_mean = history["train_seg_loss"][-1]
+                train_cls_loss_mean = history["train_cls_loss"][-1]
+                train_coord_loss_mean = history["train_coord_loss"][-1]
+                train_total_loss_mean = history["train_total_loss"][-1]
+                
+                # Get current learning rate
+                current_lr = self.optimizer.param_groups[0]["lr"]
+                
+                # Create table header with dynamic variables
+                self.accelerator.print(f"\n{'='*150}")
+                self.accelerator.print(f"Epoch {epoch}/{self.epochs} | LR: {current_lr:.2e} | Alpha: {current_alpha:.4f} | Sigma: {self.current_heatmap_sigma:.1f} | Weights: [{mtl_str}]")
+                self.accelerator.print(f"{'='*150}")
+                
+                # Metrics table
+                self.accelerator.print(f"{'':8} | {'TotalLoss':>9} | {'SegLoss':>8} | {'ClsLoss':>8} | {'CoordLoss':>9} | {'Acc':>6} | {'Sens':>6} | {'PPV':>6} | {'NPV':>6} | {'Dice':>6} | {'Core':>6} | {'Peak':>6} | {'Focus':>6} | {'NegMean':>7} | {'NegMax':>7}")
+                self.accelerator.print(f"{'-'*150}")
                 self.accelerator.print(
-                    f"Epoch {epoch}/{self.epochs}\n"
-                    f"  Train | Loss {np.mean(train_losses):.4f} | Acc {train_acc:.4f} | Sens {train_sens:.4f} | PPV {train_ppv:.4f} | NPV {train_npv:.4f} | Dice {train_dice_mean:.4f} | Core {train_core_dice_mean:.4f} | Peak {train_peak_mean:.2f} | Focus {train_focus_mean:.4f} | NegMean {train_neg_prob_mean:.4f} | NegMax {train_neg_prob_max:.4f}\n"
-                    f"    Val | Loss {np.mean(val_losses):.4f} | Acc {val_acc:.4f} | Sens {val_sens:.4f} | PPV {val_ppv:.4f} | NPV {val_npv:.4f} | Dice {val_dice_mean:.4f} | Core {val_core_dice_mean:.4f} | Peak {val_peak_mean:.2f} | Focus {val_focus_mean:.4f} | NegMean {val_neg_prob_mean:.4f} | NegMax {val_neg_prob_max:.4f}"
+                    f"{'Train':8} | {train_total_loss_mean:9.4f} | {train_seg_loss_mean:8.4f} | {train_cls_loss_mean:8.4f} | {train_coord_loss_mean:9.4f} | "
+                    f"{train_acc:6.4f} | {train_sens:6.4f} | {train_ppv:6.4f} | {train_npv:6.4f} | "
+                    f"{train_dice_mean:6.4f} | {train_core_dice_mean:6.4f} | {train_peak_mean:6.2f} | "
+                    f"{train_focus_mean:6.4f} | {train_neg_prob_mean:7.4f} | {train_neg_prob_max:7.4f}"
                 )
+                self.accelerator.print(
+                    f"{'Val':8} | {val_total_loss_mean:9.4f} | {val_seg_loss_mean:8.4f} | {val_cls_loss_mean:8.4f} | {val_coord_loss_mean:9.4f} | "
+                    f"{val_acc:6.4f} | {val_sens:6.4f} | {val_ppv:6.4f} | {val_npv:6.4f} | "
+                    f"{val_dice_mean:6.4f} | {val_core_dice_mean:6.4f} | {val_peak_mean:6.2f} | "
+                    f"{val_focus_mean:6.4f} | {val_neg_prob_mean:7.4f} | {val_neg_prob_max:7.4f}"
+                )
+                self.accelerator.print(f"{'='*150}\n")
 
             
 
             epoch_metrics = {
-                "train/loss": history["train_loss"][-1],
+                "train/seg_loss": train_seg_loss_mean,
+                "train/cls_loss": train_cls_loss_mean,
+                "train/coord_loss": train_coord_loss_mean,
                 "train/acc": train_acc,
                 "train/sensitivity": train_sens,
                 "train/ppv": train_ppv,
@@ -1289,7 +1437,9 @@ class TrainingPipeline:
                 "train/focus": train_focus_mean,
                 "train/neg_prob_mean": train_neg_prob_mean,
                 "train/neg_prob_max": train_neg_prob_max,
-                "val/loss": history["val_loss"][-1],
+                "val/seg_loss": val_seg_loss_mean,
+                "val/cls_loss": val_cls_loss_mean,
+                "val/coord_loss": val_coord_loss_mean,
                 "val/acc": val_acc,
                 "val/sensitivity": val_sens,
                 "val/ppv": val_ppv,
@@ -1303,9 +1453,13 @@ class TrainingPipeline:
                 "lr": self.optimizer.param_groups[0]["lr"],
                 "epoch": epoch,
             }
+            # Add MTL weights to logs
+            for k, v in mtl_weights.items():
+                epoch_metrics[k] = v
             self.accelerator.log(epoch_metrics, step=epoch)
 
-            unwrapped = self.accelerator.unwrap_model(self.model)
+            unwrapped_wrapper = self.accelerator.unwrap_model(self.wrapper)
+            unwrapped = unwrapped_wrapper.model
             # per-epoch checkpoint (optional)
             ckpt_path = Path(self.checkpoint_path)
             epoch_ckpt = ckpt_path.with_name(f"{epoch}_{ckpt_path.name}")

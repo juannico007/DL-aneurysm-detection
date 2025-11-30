@@ -14,7 +14,7 @@ MODE_ENV_VAR = "TRAINING_MODE"
 HYPERPARAMS = {
     "data_dir": "train_dataset.h5",
     "patch_csv": "train_patches.csv",
-    "proportion_to_use": 1.0,
+    "proportion_to_use": 0.1,
     "input_shape": (256, 256, 256),
     "batch_size": 20,
     "grad_accum": 2,
@@ -28,25 +28,22 @@ HYPERPARAMS = {
         "beta": 1.0,
         "lambda_tail": 0.1,
         "lambda_max": 0.1,
-        "segmentation": 0.7,
-        "classification": 0.3,
-        "coordinates": 0.1,
         "background": 0.1,
         "neg_ramp_epochs": 20,
-        "alpha_min": 0.01,
+        "alpha_min": 0.05,
         "alpha_schedule": "cosine",
     },
     "neg_warmup_epochs": 0,
     "heatmap_sigma": 5,
     # Heatmap decay strategy: {"name": "epoch"|"plateau"|"threshold", ...}
     "heatmap_decay": {
-        "min_sigma": 2.0,
+        "min_sigma": 3.0,
         "name": "plateau",
         # "epoch": 10,          # used when name == "epoch"
         # For plateau mode:
         "metric": "val_loss",
         "mode": "min",      # or "max"
-        "patience": 3,
+        "patience": 10,
         "factor": 0.9,
         # For threshold mode:
         # "metric": "val_peak_err",
