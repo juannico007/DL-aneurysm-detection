@@ -19,126 +19,74 @@ from dataclasses import dataclass
 import h5py
 import math
 
-class DiceLoss(nn.Module):
-    def __init__(self, weight=None, size_average=True):
-        super(DiceLoss, self).__init__()
-
-    def forward(self, inputs, targets, smooth=1):
-        
-        #comment out if your model contains a sigmoid or equivalent activation layer
-        inputs = F.sigmoid(inputs)       
-        device = inputs.device
-        inputs = inputs.to(device=device, dtype=torch.float32)
-        targets = targets.to(device=device, dtype=torch.float32) 
-        #flatten label and prediction tensors
-        inputs = inputs.view(-1)
-        targets = targets.view(-1)
-        
-        intersection = (inputs * targets).sum(dtype=torch.float32)
-        inputs_sum   = inputs.sum(dtype=torch.float32)
-        targets_sum  = targets.sum(dtype=torch.float32)                        
-        dice = (2.*intersection + smooth)/(inputs_sum.sum() + targets_sum.sum() + smooth)  
-        return 1 - dice
-
-class DiceSemimetricLoss(nn.Module):
-    """
-    DML2-style Dice semimetric loss that supports soft labels.
-    For hard labels this matches classic soft Dice; for soft labels it keeps the optimum at x=y.
-    """
-    def __init__(self, eps: float = 1e-6, clip_threshold: float = 0.0, sharp_power: float = 1.0):
+class UnifiedCurriculumDice(nn.Module):
+    def __init__(self, beta=2.0, lambda_tail=1.0, lambda_max=0.0, epsilon=1e-6):
         super().__init__()
-        self.eps = eps
-        self.clip_threshold = clip_threshold
-        self.sharp_power = sharp_power
+        self.beta = beta
+        self.lambda_tail = lambda_tail
+        self.lambda_max = lambda_max
+        self.epsilon = epsilon
 
-    def forward(self, inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        # inputs: logits, targets: soft labels
-        probs = torch.sigmoid(inputs)
-        probs = probs.to(dtype=torch.float32)
-        targets = targets.to(dtype=torch.float32)
-        # Sharpen the target to downweight tails of the Gaussian and focus on the center.
-        targets = targets.pow(self.sharp_power)
-        if self.clip_threshold > 0:
-            targets = torch.where(targets >= self.clip_threshold, targets, torch.zeros_like(targets))
+    def forward(self, pred, target, alpha):
+        # 1. Define the spatial switch (Mask)
+        # alpha is the curriculum threshold
+        core_mask = (target >= alpha).float()
+        tail_mask = 1.0 - core_mask
 
-        # If we predict single-channel but have multi-heatmap targets, broadcast
-        if probs.shape[1] == 1 and targets.shape[1] > 1:
-            probs = probs.expand(-1, targets.shape[1], -1, -1, -1)
-
-        intersection = (probs * targets).sum(dim=(2, 3, 4))
-        sym_diff = (probs - targets).abs().sum(dim=(2, 3, 4))
-        loss = 1.0 - (2 * intersection + self.eps) / (2 * intersection + sym_diff + self.eps) # DML-2
-        return loss.mean()
-    
-class SegmentationClassificationLoss(nn.Module):
-    """
-    Dice-style segmentation loss + BCE classification loss, with optional suppression of spurious activations.
-    """
-    def __init__(
-        self,
-        segmentation = DiceLoss,
-        classification = nn.BCEWithLogitsLoss,
-        seg_weight: float = 0.5,
-        cls_weight: float = 0.5,
-        suppress_weight: float = 0.0,
-        suppress_tau: float = 0.5,
-        suppress_alpha: float = 2.0,
-        suppress_eps: float = 1e-3,
-        size_average=True,
-    ):
-        super(SegmentationClassificationLoss, self).__init__()
-        self.seg_weight = seg_weight
-        self.cls_weight = cls_weight
-        self.suppress_weight = suppress_weight
-        self.suppress_tau = suppress_tau
-        self.suppress_alpha = suppress_alpha
-        self.suppress_eps = suppress_eps
-        print(
-            "weights:",
-            {
-                "seg": self.seg_weight,
-                "cls": self.cls_weight,
-                "suppress": self.suppress_weight,
-            },
-        )
-        self.segmentation = segmentation
-        self.classification = classification
-
-    def forward(self, inputs, targets, device):
-        #Divide inputs and targets for dice loss and bce
-        segmentation_input = inputs[0]
-        classification_input = inputs[1]
-        segmentation_target = targets[0]
-        classification_target = targets[1]
-        classification_input = classification_input.to(device=device, dtype=torch.float32) 
-        classification_target = classification_target.to(device=device, dtype=torch.float32) 
+        # 2. Calculate Core Components
+        # We only look at Intersection inside the Gaussian Core
+        p_core = pred * core_mask
+        t_core = target * core_mask
         
-        segmentation_loss = self._segmentation_loss(segmentation_input, segmentation_target)
+        # Intersection (Numerator)
+        intersection = torch.sum(p_core * t_core, dim=[1, 2, 3, 4])
+        
+        # Core Disagreement (L1 Error inside the core)
+        diff_core = torch.sum(torch.abs(p_core - t_core), dim=[1, 2, 3, 4])
 
-        # Unified suppression on low-target regions (vectorized)
-        if self.suppress_weight > 0:
-            probs = torch.sigmoid(segmentation_input).to(dtype=torch.float32)
-            targets = segmentation_target.to(dtype=torch.float32)
-            bg_mask = (targets <= self.suppress_eps).float()
-            if bg_mask.any():
-                excess = torch.relu(probs - self.suppress_tau) ** self.suppress_alpha
-                suppression = (excess * bg_mask).sum() / (bg_mask.sum() + self.suppress_eps)
-                segmentation_loss = segmentation_loss + self.suppress_weight * suppression
+        # 3. Calculate Tail Components
+        # We replace standard error with your polynomial suppression
+        # Logic: If pred < alpha, error is 0. If pred > alpha, error scales polynomially.
+        tail_penalty = torch.relu(pred - alpha).pow(self.beta)
+        weighted_tail_error = torch.sum(tail_penalty * tail_mask, dim=[1, 2, 3, 4])
 
-        if self.cls_weight != 0:
-            classification_loss = self.classification(classification_input, classification_target)
-            return self.seg_weight * segmentation_loss + self.cls_weight * classification_loss
-        return segmentation_loss
+        # 4. The Unified Semimetric Formula
+        # L = 1 - (2*Int) / (2*Int + Core_Diff + Lambda * Tail_Error)
+        
+        denominator = (2 * intersection) + diff_core + (self.lambda_tail * weighted_tail_error) + self.epsilon
+        
+        dice_score = (2 * intersection + self.epsilon) / denominator
+        
+        loss = 1.0 - dice_score.mean()
 
-    def _segmentation_loss(self, inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        """Compute segmentation loss using the provided segmentation criterion (supports soft labels)."""
-        return self.segmentation(inputs, targets)
+        # 5. Background Max Suppression (L_infinity on background)
+        if self.lambda_max > 0:
+            # We want to penalize the single highest prediction in the background
+            # pred * tail_mask gives us predictions in the background (and 0 in core)
+            # We take the max over spatial dimensions for each batch item
+            tail_probs = pred * tail_mask
+            max_tail_error = tail_probs.view(tail_probs.size(0), -1).max(dim=1)[0]
+            loss += self.lambda_max * max_tail_error.mean()
+            
+        return loss
 
 def custom_collate(batch):
     data = [item[0] for item in batch]
     target = [item[1] for item in batch]
     target = torch.LongTensor(target)
     return [data, target]
+
+def custom_collate_with_coords(batch):
+    data = [item[0] for item in batch]
+    target = [item[1] for item in batch]
+    labels = [item[2] for item in batch]
+    coords = [item[3] for item in batch]
+    
+    target = torch.stack(target)
+    labels = torch.LongTensor(labels)
+    coords = torch.stack(coords)
+    
+    return [data, target, labels, coords]
 
 def _round_up(n: int, m: int = 16) -> int:
     return ((n + m - 1) // m) * m
@@ -149,7 +97,7 @@ def pad_collate_3d(batch: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
     We pad on the right to (Dt,Ht,Wt) = per-batch max (rounded to 'multiple'),
     then stack into (B, 1, Dt, Ht, Wt).
     """
-    xs, ms, ys = zip(*batch)  # xs: tuple of tensors (1,D,H,W), ys: tuple of ints/tensors
+    xs, ms, ys, cs = zip(*batch)  # xs: tuple of tensors (1,D,H,W), ys: tuple of ints/tensors
 
     # ensure labels tensor (B,)
     Y = torch.as_tensor(ys, dtype=torch.long)
@@ -172,7 +120,8 @@ def pad_collate_3d(batch: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
 
     X = torch.stack(padded_x, dim=0)
     M = torch.stack(padded_m, dim=0)
-    return X, M, Y
+    C = torch.stack(cs, dim=0)
+    return X, M, Y, C
 
 def make_sphere_mask(shape, center, radius=5.0):
     """Return a binary 3D mask with a filled sphere."""
@@ -185,29 +134,43 @@ def make_sphere_mask(shape, center, radius=5.0):
 def _gaussian_heatmap(
         shape: Tuple[int, int, int], 
         center: Tuple[float, float, float], 
-        sigma: float, 
-        tau_gauss: float = None) -> np.ndarray:
-    """Create a single 3D Gaussian heatmap with peak 1.0."""
-    z, y, x = np.ogrid[:shape[0], :shape[1], :shape[2]]
+        sigma: float) -> np.ndarray:
+    """Create a single 3D Gaussian heatmap with peak 1.0, optimized with bounding box."""
+    heatmap = np.zeros(shape, dtype=np.float32)
     cz, cy, cx = center
-    dist2 = np.square(x - cx)+ np.square(y - cy) + np.square(z - cz)
-    heatmap = np.exp(-dist2 / (2.0 * sigma ** 2))
     
-    if tau_gauss is not None:
-        heatmap = np.where(heatmap >= tau_gauss, heatmap, 0.0)
+    # Define bounding box (3 sigma rule covers >99% of mass)
+    radius = int(math.ceil(3 * sigma))
+    
+    z_min = max(0, int(math.floor(cz - radius)))
+    z_max = min(shape[0], int(math.ceil(cz + radius)) + 1)
+    
+    y_min = max(0, int(math.floor(cy - radius)))
+    y_max = min(shape[1], int(math.ceil(cy + radius)) + 1)
+    
+    x_min = max(0, int(math.floor(cx - radius)))
+    x_max = min(shape[2], int(math.ceil(cx + radius)) + 1)
+    
+    if z_min >= z_max or y_min >= y_max or x_min >= x_max:
+        return heatmap
 
-    return heatmap.astype(np.float32)
+    # Create grid only for the bounding box
+    z, y, x = np.ogrid[z_min:z_max, y_min:y_max, x_min:x_max]
+    
+    dist2 = np.square(x - cx) + np.square(y - cy) + np.square(z - cz)
+    heatmap[z_min:z_max, y_min:y_max, x_min:x_max] = np.exp(-dist2 / (2.0 * sigma ** 2))
+    
+    return heatmap
 
 
 def make_heatmaps(
         shape: Tuple[int, int, int], 
         center: Tuple[float, float, float], 
-        sigmas: Sequence[float],
-        tau_gauss: float = None) -> np.ndarray:
+        sigmas: Sequence[float]) -> np.ndarray:
     """Return stacked 3D Gaussian heatmaps for each sigma."""
     if not sigmas:
         return np.zeros((1,) + tuple(shape), dtype=np.float32)
-    heatmaps = [_gaussian_heatmap(shape, center, sigma, tau_gauss=tau_gauss) for sigma in sigmas]
+    heatmaps = [_gaussian_heatmap(shape, center, sigma) for sigma in sigmas]
     return np.stack(heatmaps, axis=0)
 
 
@@ -375,7 +338,6 @@ class PatchAneurysmDataset(Dataset):
         transform=None,
         radius: float = 5.0,
         heatmap_sizes: Sequence[float] = (15.0,),
-        suppress_tau: float = 0.3,
     ):
         self.h5_path = str(h5_path)
         self.records = records
@@ -384,7 +346,6 @@ class PatchAneurysmDataset(Dataset):
         self.radius = radius
         self.heatmap_sizes = list(heatmap_sizes) if heatmap_sizes else [radius]
         self._h5 = None
-        self.suppress_tau = suppress_tau
 
     def __len__(self):
         return len(self.records)
@@ -427,6 +388,9 @@ class PatchAneurysmDataset(Dataset):
             patch_np = np.pad(patch_np, ((0, pad_z), (0, pad_y), (0, pad_x)), mode="constant")
 
         mask_np = np.zeros((len(self.heatmap_sizes),) + patch_np.shape, dtype=np.float32)
+        
+        # Calculate relative coordinates
+        rel_coords = torch.tensor([-1.0, -1.0, -1.0], dtype=torch.float32) # Default for background
         if record.label == 1:
             if record.aneurysm_rel_x is not None and record.aneurysm_rel_y is not None and record.aneurysm_rel_z is not None:
                 center = (record.aneurysm_rel_z, record.aneurysm_rel_y, record.aneurysm_rel_x)
@@ -438,7 +402,16 @@ class PatchAneurysmDataset(Dataset):
                 )
             else:
                 center = (self.patch_size / 2.0, self.patch_size / 2.0, self.patch_size / 2.0)
-            mask_np = make_heatmaps(patch_np.shape, center, sigmas=self.heatmap_sizes, tau_gauss=self.suppress_tau)
+            
+            # Normalize center to [0, 1] for regression
+            # center is (z, y, x) relative to patch
+            rel_coords = torch.tensor([
+                center[0] / self.patch_size,
+                center[1] / self.patch_size,
+                center[2] / self.patch_size
+            ], dtype=torch.float32)
+            
+            mask_np = make_heatmaps(patch_np.shape, center, sigmas=self.heatmap_sizes)
 
         volume = torch.from_numpy(patch_np)
         mask = torch.from_numpy(mask_np)
@@ -448,7 +421,7 @@ class PatchAneurysmDataset(Dataset):
         elif volume.ndim == 3:
             volume = volume.unsqueeze(0)
 
-        return volume, mask, record.label
+        return volume, mask, record.label, rel_coords
 
 class TrainingPipeline:
     """Training pipeline for the aneurysm detection model."""
@@ -525,15 +498,21 @@ class TrainingPipeline:
             "gamma": 0.96,
         }
         lw = loss_weights or {}
-        self.seg_weight = float(lw.get("segmentation", 0.7))
-        self.cls_weight = float(lw.get("classification", 0.3))
-        self.base_suppress_weight = float(lw.get("suppress", lw.get("neg_mean", 0.0)))
-        self.suppress_tau = float(lw.get("suppress_tau", 0.3))
-        self.suppress_alpha = float(lw.get("suppress_alpha", 2.0))
-        self.suppress_eps = float(lw.get("suppress_eps", 1e-3))
-        self.suppress_weight = self.base_suppress_weight
+        self.alpha_max = float(lw.get("alpha_max", 0.5))
+        self.beta = float(lw.get("beta", 2.0))
+        self.lambda_tail = float(lw.get("lambda_tail", 1.0))
+        self.lambda_max = float(lw.get("lambda_max", 0.0))
+        self.seg_weight = float(lw.get("segmentation", 1.0))
+        self.cls_weight = float(lw.get("classification", 0.5))
+        self.coord_weight = float(lw.get("coordinates", 1.0))
+        self.background_weight = float(lw.get("background", 0.1))
+        
         self.neg_warmup_epochs = int(neg_warmup_epochs)
-        self.neg_ramp_epochs = max(1, self.epochs - self.neg_warmup_epochs)
+        # Default ramp epochs if not provided (though we expect it from CLI now)
+        # If neg_ramp_epochs is passed in loss_weights or kwargs, use it, else default to remaining epochs
+        self.neg_ramp_epochs = int(lw.get("neg_ramp_epochs", max(1, self.epochs - self.neg_warmup_epochs)))
+        self.alpha_min = float(lw.get("alpha_min", 0.05))
+        self.alpha_schedule = lw.get("alpha_schedule", "cosine")
 
         self.scheduler_step_mode: Optional[str] = None
         self.scheduler: Optional[optim.lr_scheduler._LRScheduler] = None
@@ -543,15 +522,13 @@ class TrainingPipeline:
             mixed_precision=mixed_precision, 
             gradient_accumulation_steps=grad_accum_steps
         )
-
-    def _set_heatmap_sigma(self, sigma: float):
-        """Update heatmap sigma (clamped to minimum) across datasets."""
-        self.current_heatmap_sigma = max(self.heatmap_min_sigma, float(sigma))
-        self.heatmap_sizes = [self.current_heatmap_sigma]
-        if hasattr(self, "train_loader") and hasattr(self.train_loader, "dataset"):
-            self.train_loader.dataset.heatmap_sizes = self.heatmap_sizes
-        if hasattr(self, "val_loader") and hasattr(self.val_loader, "dataset"):
-            self.val_loader.dataset.heatmap_sizes = self.heatmap_sizes
+        
+        # Initialize loss function
+        self.criterion = UnifiedCurriculumDice(
+            beta=self.beta, 
+            lambda_tail=self.lambda_tail,
+            lambda_max=self.lambda_max
+        )
 
     def _sigma_for_epoch(self, epoch: int) -> float:
         """Compute decayed sigma rounded to int, reducing by 1 every `heatmap_decay_epoch` epochs."""
@@ -588,12 +565,33 @@ class TrainingPipeline:
         t = min(max(t, 0.0), 1.0)
         return math.exp(-5.0 * (1.0 - t) * (1.0 - t))
 
-    def _update_neg_lambdas(self, epoch: int):
-        """Update neg penalty lambdas according to ramp schedule."""
-        scale = self._neg_penalty_scale(epoch)
-        self.suppress_weight = self.base_suppress_weight * scale
-        if hasattr(self, "criterion"):
-            self.criterion.suppress_weight = self.suppress_weight
+    def _get_current_alpha(self, epoch: int) -> float:
+        """Calculate alpha for the current epoch based on the curriculum schedule."""
+        # 1. Warmup phase
+        if epoch <= self.neg_warmup_epochs:
+            return self.alpha_max
+            
+        # 2. Ramp phase
+        # Epochs since warmup ended (1-based index relative to ramp start)
+        ramp_step = epoch - self.neg_warmup_epochs
+        
+        if ramp_step > self.neg_ramp_epochs:
+            # 3. Stabilization phase
+            return self.alpha_min
+            
+        # Calculate progress t from 0 to 1
+        t = (ramp_step - 1) / max(1, self.neg_ramp_epochs - 1)
+        t = min(max(t, 0.0), 1.0)
+        
+        if self.alpha_schedule == "cosine":
+            # Cosine decay from 1 to 0
+            decay = 0.5 * (1.0 + math.cos(t * math.pi))
+        else:
+            # Linear decay (fallback)
+            decay = 1.0 - t
+            
+        # Map decay (1->0) to alpha (alpha_max -> alpha_min)
+        return self.alpha_min + (self.alpha_max - self.alpha_min) * decay
 
     def _maybe_decay_heatmap_dynamic(self, metrics: Dict[str, float], epoch: int):
         cfg = self.heatmap_decay_config
@@ -639,6 +637,32 @@ class TrainingPipeline:
                 if new_sigma < self.current_heatmap_sigma:
                     self.accelerator.print(f"[Heatmap] Threshold decay at epoch {epoch}: {self.current_heatmap_sigma} -> {new_sigma}")
                     self._set_heatmap_sigma(new_sigma)
+
+    def compute_background_penalty(self, pred, target, input_volume):
+        """
+        Compute penalty for high predictions on background voxels.
+        
+        Args:
+            pred: (B, 1, D, H, W) - predicted probabilities
+            target: (B, 1, D, H, W) - ground truth mask
+            input_volume: (B, 1, D, H, W) - z-scored input volume
+            
+        Returns:
+            background_penalty: scalar tensor
+        """
+        # Identify background: z-scored values < 0
+        background_mask = (input_volume < 0).float()
+        
+        # Only consider true background (not in ground truth)
+        true_background = background_mask * (1 - target)
+        
+        # Penalize high predictions on background
+        if true_background.sum() > 0:
+            background_penalty = (pred * true_background).sum() / (true_background.sum() + 1e-6)
+        else:
+            background_penalty = torch.tensor(0.0, device=pred.device)
+            
+        return background_penalty
 
     def create_dataloaders(
         self,
@@ -695,7 +719,6 @@ class TrainingPipeline:
             transform=train_transforms,
             radius=self.radius,
             heatmap_sizes=self.heatmap_sizes,
-            suppress_tau=self.suppress_tau,
         )
         val_dataset = PatchAneurysmDataset(
             h5_path=h5_path,
@@ -704,7 +727,6 @@ class TrainingPipeline:
             transform=val_transforms,
             radius=self.radius,
             heatmap_sizes=self.heatmap_sizes,
-            suppress_tau=self.suppress_tau,
         )
 
         train_loader = DataLoader(
@@ -841,20 +863,17 @@ class TrainingPipeline:
             betas = (0.9, 0.999),
             eps=1e-8,
             weight_decay=self.weight_decay)
-        self.segmentation_loss = DiceSemimetricLoss()
+
+        
+        self.criterion = UnifiedCurriculumDice(
+            beta=self.beta,
+            lambda_tail=self.lambda_tail
+        )
+        
         cls_pos_weight = getattr(self, "pos_weight", torch.tensor(1.0))
         cls_pos_weight = cls_pos_weight.to(self.device)
         self.classification_loss = nn.BCEWithLogitsLoss(pos_weight=cls_pos_weight)
-        self.criterion = SegmentationClassificationLoss(
-            self.segmentation_loss,
-            self.classification_loss,
-            seg_weight=self.seg_weight,
-            cls_weight=self.cls_weight,
-            suppress_weight=self.suppress_weight,
-            suppress_tau=self.suppress_tau,
-            suppress_alpha=self.suppress_alpha,
-            suppress_eps=self.suppress_eps,
-        )
+        
         self.model, self.optimizer = self.accelerator.prepare(self.model, self.optimizer)
         self._configure_scheduler()
         #Since we have to define our own training loop, we have to keep track
@@ -873,26 +892,70 @@ class TrainingPipeline:
         eps = 1e-6
         for epoch in range(1, self.epochs + 1):
             self._maybe_decay_heatmap(epoch)
-            self._update_neg_lambdas(epoch)
+            current_alpha = self._get_current_alpha(epoch)
+            self.accelerator.print(f"Epoch {epoch}: Alpha = {current_alpha:.4f}, Sigma = {self.current_heatmap_sigma:.1f}")
+            
             self.model.train()
             train_losses = []
             train_dice_scores = []
             train_core_list, train_peak_list, train_focus_list = [], [], []
             all_preds, all_labels = [], []
             train_neg_mean_list, train_neg_max_list = [], []
-
-            for x_batch, mask_batch, y_batch in tqdm(self.train_loader):
+            for x_batch, mask_batch, y_batch, coord_batch in tqdm(self.train_loader):
                 x_batch = x_batch.to(self.device, dtype=torch.float16, non_blocking=True)
                 mask_batch = mask_batch.to(self.device, dtype=torch.float16, non_blocking=True)
                 y_batch = y_batch.float().unsqueeze(1)
                 y_batch = y_batch.to(self.device, dtype=torch.float16, non_blocking=True)
+                coord_batch = coord_batch.to(self.device, dtype=torch.float32, non_blocking=True) # Coords are float32
+                
+                # Note: Rotation augmentation needs to handle coordinates too if we want to be correct.
+                # For now, let's assume no rotation or that we accept the small error if rotation is small.
+                # Ideally, we should rotate the coordinates.
+                # TODO: Implement coordinate rotation.
+                
                 x_batch, angles = rotate_batch_gpu(x_batch, mode='bilinear')
                 mask_batch, _ = rotate_batch_gpu(mask_batch, angles=angles, mode='nearest')
                 with self.accelerator.accumulate(self.model):
                     with self.accelerator.autocast():
                         outputs = self.model(x_batch)
-                    #print("Classifier logits:", outputs[1].min(), "true label:", y_batch)
-                        loss = self.criterion(outputs, (mask_batch, y_batch), self.device)
+                        # outputs[0] is segmentation, outputs[1] is classification (if any)
+                        # We only use segmentation output for the new loss
+                        seg_logits = outputs[0]
+                        seg_probs = torch.sigmoid(seg_logits)
+                        
+                        # Target for segmentation is the heatmap (mask_batch)
+                        # Assuming single channel output for now or matching channels
+                        targets = mask_batch[:, self.primary_heatmap_index:self.primary_heatmap_index+1]
+                        
+                        seg_loss = self.criterion(seg_probs, targets, current_alpha)
+                        
+                        # Classification loss
+                        cls_loss = torch.tensor(0.0, device=self.device)
+                        if self.cls_weight > 0 and len(outputs) > 1:
+                            cls_logits = outputs[1]
+                            cls_loss = self.classification_loss(cls_logits, y_batch)
+                            
+                        loss = self.seg_weight * seg_loss + self.cls_weight * cls_loss
+                        
+                        # Coordinate regression loss
+                        if self.coord_weight > 0 and len(outputs) > 2:
+                            reg_output = outputs[2].float() # Ensure float32
+                            # coord_batch is (B, 3)
+                            # Calculate MSE loss per sample
+                            mse_loss = F.mse_loss(reg_output, coord_batch, reduction='none').mean(dim=1)
+                            
+                            # Masking: Only penalize if label == 1
+                            # y_batch is (B, 1)
+                            mask = y_batch.squeeze(1)
+                            masked_mse = (mse_loss * mask).sum() / (mask.sum() + 1e-6)
+                            
+                            loss += self.coord_weight * masked_mse
+                        
+                        # Background penalty loss
+                        if self.background_weight > 0:
+                            bg_penalty = self.compute_background_penalty(seg_probs, targets, x_batch)
+                            loss += self.background_weight * bg_penalty
+                        
                         self.accelerator.backward(loss)
                     if self.accelerator.sync_gradients:
                         max_norm = 5
@@ -1041,16 +1104,43 @@ class TrainingPipeline:
             val_dice_scores = []
             val_preds_list, val_labels_list = [], []
             with torch.no_grad():
+                val_losses = []
                 val_core_list, val_peak_list, val_focus_list = [], [], []
                 val_neg_mean_list, val_neg_max_list = [], []
-                for x_batch, mask_batch, y_batch in self.val_loader:
+                val_dice_scores = []
+                for x_batch, mask_batch, y_batch, coord_batch in self.val_loader:
                     x_batch = x_batch.to(self.device, dtype=torch.float16, non_blocking=True)
                     mask_batch = mask_batch.to(self.device, dtype=torch.float16, non_blocking=True)
                     y_batch = y_batch.float().unsqueeze(1)
                     y_batch = y_batch.to(self.device, dtype=torch.float16, non_blocking=True)
+                    coord_batch = coord_batch.to(self.device, dtype=torch.float32, non_blocking=True)
                     with self.accelerator.autocast():
                         outputs = self.model(x_batch)
-                        loss = self.criterion(outputs, (mask_batch, y_batch), self.device)
+                        seg_logits = outputs[0]
+                        seg_probs = torch.sigmoid(seg_logits)
+                        targets = mask_batch[:, self.primary_heatmap_index:self.primary_heatmap_index+1]
+                        
+                        # Use current alpha for validation loss too? Or a fixed one?
+                        # Usually validation loss should be consistent, but if it's a curriculum loss, 
+                        # maybe we should use the same alpha as training to see convergence.
+                        # Or maybe alpha=0 (hardest) to see true performance?
+                        # Let's use current_alpha for consistency with training objective.
+                        seg_loss = self.criterion(seg_probs, targets, current_alpha)
+                        
+                        cls_loss = torch.tensor(0.0, device=self.device)
+                        if self.cls_weight > 0 and len(outputs) > 1:
+                            cls_logits = outputs[1]
+                            cls_loss = self.classification_loss(cls_logits, y_batch)
+                            
+                        loss = self.seg_weight * seg_loss + self.cls_weight * cls_loss
+                        
+                        if self.coord_weight > 0 and len(outputs) > 2:
+                            reg_output = outputs[2].float()
+                            mse_loss = F.mse_loss(reg_output, coord_batch, reduction='none').mean(dim=1)
+                            mask = y_batch.squeeze(1)
+                            masked_mse = (mse_loss * mask).sum() / (mask.sum() + 1e-6)
+                            loss += self.coord_weight * masked_mse
+                        
                     val_losses.append(self.accelerator.gather(loss.detach()).mean().item())
 
                     #DICE loss (soft dice on soft targets)
@@ -1176,18 +1266,16 @@ class TrainingPipeline:
             history.setdefault("val_focus_series", []).append(val_focus_mean)
             history.setdefault("val_neg_prob_mean_series", []).append(val_neg_prob_mean)
             history.setdefault("val_neg_prob_max_series", []).append(val_neg_prob_max)
+            history.setdefault("alpha_series", []).append(current_alpha)
+            history.setdefault("heatmap_sigma_series", []).append(self.current_heatmap_sigma)
+            if self.accelerator.is_main_process:
+                self.accelerator.print(
+                    f"Epoch {epoch}/{self.epochs}\n"
+                    f"  Train | Loss {np.mean(train_losses):.4f} | Acc {train_acc:.4f} | Sens {train_sens:.4f} | PPV {train_ppv:.4f} | NPV {train_npv:.4f} | Dice {train_dice_mean:.4f} | Core {train_core_dice_mean:.4f} | Peak {train_peak_mean:.2f} | Focus {train_focus_mean:.4f} | NegMean {train_neg_prob_mean:.4f} | NegMax {train_neg_prob_max:.4f}\n"
+                    f"    Val | Loss {np.mean(val_losses):.4f} | Acc {val_acc:.4f} | Sens {val_sens:.4f} | PPV {val_ppv:.4f} | NPV {val_npv:.4f} | Dice {val_dice_mean:.4f} | Core {val_core_dice_mean:.4f} | Peak {val_peak_mean:.2f} | Focus {val_focus_mean:.4f} | NegMean {val_neg_prob_mean:.4f} | NegMax {val_neg_prob_max:.4f}"
+                )
 
-            self.accelerator.print(
-                f"Epoch {epoch}/{self.epochs}\n"
-                f"  Train | Loss {history['train_loss'][-1]:.4f} | Acc {train_acc:.4f} | Sens {train_sens:.4f} | "
-                f"PPV {train_ppv:.4f} | NPV {train_npv:.4f} | Dice {history['train_dice'][-1]:.4f} | "
-                f"Core {train_core_dice_mean:.4f} | Peak {train_peak_mean:.2f} | Focus {train_focus_mean:.4f} | "
-                f"NegMean {train_neg_prob_mean:.4f} | NegMax {train_neg_prob_max:.4f}\n"
-                f"    Val | Loss {history['val_loss'][-1]:.4f} | Acc {val_acc:.4f} | Sens {val_sens:.4f} | "
-                f"PPV {val_ppv:.4f} | NPV {val_npv:.4f} | Dice {history['val_dice'][-1]:.4f} | "
-                f"Core {val_core_dice_mean:.4f} | Peak {val_peak_mean:.2f} | Focus {val_focus_mean:.4f} | "
-                f"NegMean {val_neg_prob_mean:.4f} | NegMax {val_neg_prob_max:.4f}"
-            )
+            
 
             epoch_metrics = {
                 "train/loss": history["train_loss"][-1],

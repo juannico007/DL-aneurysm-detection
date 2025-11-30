@@ -116,6 +116,8 @@ def sliding_window(volume: np.ndarray, patch_size: int, stride: int) -> Iterable
         for y in y_starts:
             for x in x_starts:
                 patch = volume[z : z + patch_size, y : y + patch_size, x : x + patch_size]
+                # if patch.mean() < 0: 
+                #     continue  # skip background patches
                 yield patch, (z, y, x)
 
 
@@ -184,7 +186,7 @@ def build_gaussian_gt(shape: Optional[Tuple[int, int, int]], series_id: str, loc
             return None
         heatmap = np.zeros(shape, dtype=np.float32)
         for cz, cy, cx in pts:
-            heatmap += make_heatmaps(shape, (cz, cy, cx), [sigma], tau_gauss=tau)[0]
+            heatmap += make_heatmaps(shape, (cz, cy, cx), [sigma])[0]
         return np.clip(heatmap, 0.0, 1.0)
     except Exception as e:
         print(f"[Warn] Failed to build Gaussian GT mask: {e}")
@@ -216,9 +218,9 @@ def run_sliding_inference(cfg: InferenceConfig, series_id: str, out_prefix: Path
             patch_t = torch.from_numpy(patch_np).unsqueeze(0).unsqueeze(0).to(device=device, dtype=torch.float32)
             if use_amp:
                 with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
-                    seg_logits, _ = model(patch_t)
+                    seg_logits, _, _ = model(patch_t)
             else:
-                seg_logits, _ = model(patch_t)
+                seg_logits, _, _ = model(patch_t)
             seg_probs = torch.sigmoid(seg_logits.float()).cpu().numpy()[0, 0]
             prob[z : z + cfg.patch_size, y : y + cfg.patch_size, x : x + cfg.patch_size] += seg_probs * weight_mask
             counts[z : z + cfg.patch_size, y : y + cfg.patch_size, x : x + cfg.patch_size] += weight_mask
@@ -378,7 +380,7 @@ def get_layer_data(model: torch.nn.Module, volume: np.ndarray, patch_size: int =
 # -----------------------------
 
 def main():
-    base_output = Path("cloud_models/MihaiB-dev/suppression-loss_threshold-on-gauss-5")
+    base_output = Path("cloud_models/MihaiB-dev/new-loss-2_curriculum-learning-alpha-5")
     history_path = base_output / "history.pickle"
     output_folder = base_output
 
@@ -396,7 +398,7 @@ def main():
         print(f"[Warn] Could not pick positive/negative series IDs for inference examples: {e}")
         pos_id, neg_id = None, None
 
-    ckpt_candidates = list(base_output.glob("40_MihaiB-dev_suppression-loss_threshold-on-gauss-5.pt"))
+    ckpt_candidates = list(base_output.glob("40_MihaiB-dev_new-loss-2_curriculum-learning-alpha-5.pt"))
     if ckpt_candidates and pos_id and neg_id:
         print(f"[Info] Using checkpoint {ckpt_candidates[0]} for inference examples.")
         cfg = InferenceConfig(
@@ -409,7 +411,7 @@ def main():
             blend_mode="hann",
             gaussian_sigma=None,
             localizers_path=Path("train_localizers.csv"),
-            gauss_sigma=15.0,
+            gauss_sigma=5.0,
             gauss_tau=0.1,
         )
         image_out = base_output / "image_results"
