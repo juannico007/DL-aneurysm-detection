@@ -208,6 +208,12 @@ def run_sliding_inference(cfg: InferenceConfig, series_id: str, out_prefix: Path
     prob = np.zeros_like(vol, dtype=np.float32)
     counts = np.zeros_like(vol, dtype=np.float32)
     weight_mask = build_weight_mask(cfg.patch_size, mode=cfg.blend_mode, sigma=cfg.gaussian_sigma)
+    
+    attention_maps = []
+    for _ in range(len(model.up_blocks)):
+        attention_maps.append(np.zeros_like(vol, dtype=np.float32))
+        
+    attention_counts = [np.zeros_like(vol, dtype=np.float32) for _ in range(len(model.up_blocks))]
 
     use_amp = bool(cfg.use_mixed_precision and device.type == "cuda")
 
@@ -222,22 +228,49 @@ def run_sliding_inference(cfg: InferenceConfig, series_id: str, out_prefix: Path
             seg_probs = torch.sigmoid(seg_logits.float()).cpu().numpy()[0, 0]
             prob[z : z + cfg.patch_size, y : y + cfg.patch_size, x : x + cfg.patch_size] += seg_probs * weight_mask
             counts[z : z + cfg.patch_size, y : y + cfg.patch_size, x : x + cfg.patch_size] += weight_mask
+            for level_idx, up_block in enumerate(model.up_blocks):
+                if hasattr(up_block.attention, 'last_attention'):
+                    att = up_block.attention.last_attention
+                    if att is not None:
+                        att_resized = torch.nn.functional.interpolate(
+                            att, 
+                            size=(cfg.patch_size, cfg.patch_size, cfg.patch_size),
+                            mode='trilinear',
+                            align_corners=False
+                        ).cpu().numpy()[0, 0]
+                        
+                        attention_maps[level_idx][
+                            z : z + cfg.patch_size, 
+                            y : y + cfg.patch_size, 
+                            x : x + cfg.patch_size
+                        ] += att_resized * weight_mask
+                        
+                        attention_counts[level_idx][
+                            z : z + cfg.patch_size, 
+                            y : y + cfg.patch_size, 
+                            x : x + cfg.patch_size
+                        ] += weight_mask
 
     counts[counts == 0] = 1.0
     prob /= counts
     mask = (prob >= cfg.threshold).astype(np.uint8)
+    for level_idx in range(len(attention_maps)):
+        attention_counts[level_idx][attention_counts[level_idx] == 0] = 1.0
+        attention_maps[level_idx] /= attention_counts[level_idx]
 
     ensure_dir(out_prefix.parent)
     cfg_serializable = json.loads(json.dumps(asdict(cfg), default=str))
-    np.savez_compressed(
-        out_prefix.with_suffix(".npz"),
-        prob=prob.astype(np.float16),
-        mask=mask.astype(np.uint8),
-        gt_gauss=gt_gauss.astype(np.float32) if gt_gauss is not None else np.zeros((1, 1, 1), dtype=np.float32),
-        metadata=json.dumps(cfg_serializable),
-        series_id=series_id,
-    )
+    save_dict = {
+        'prob': prob.astype(np.float16),
+        'mask': mask.astype(np.uint8),
+        'gt_gauss': gt_gauss.astype(np.float32) if gt_gauss is not None else np.zeros((1, 1, 1), dtype=np.float32),
+        'metadata': json.dumps(cfg_serializable),
+        'series_id': series_id,
+    }
+    
+    np.savez_compressed(out_prefix.with_suffix(".npz"), **save_dict)
     print(f"[Info] Saved inference outputs to {out_prefix.with_suffix('.npz')}")
+    
     # Save NIfTI volumes for easier inspection
     try:
         import nibabel as nib
@@ -247,6 +280,10 @@ def run_sliding_inference(cfg: InferenceConfig, series_id: str, out_prefix: Path
         nib.save(nib.Nifti1Image(vol.astype(np.float32), affine), out_prefix.with_suffix(".vol.nii.gz"))
         if gt_gauss is not None:
             nib.save(nib.Nifti1Image(gt_gauss.astype(np.float32), affine), out_prefix.with_suffix(".gt_gauss.nii.gz"))
+        for level_idx, att_map in enumerate(attention_maps):
+            att_path = out_prefix.with_name(f"{out_prefix.stem}.attention_L{level_idx}.nii.gz")
+            nib.save(nib.Nifti1Image(att_map.astype(np.float32), affine), att_path)
+            print(f"[Info] Saved attention map level {level_idx}")
         print(f"[Info] Saved NIfTI outputs (.prob/.mask/.vol) for {series_id}")
     except ImportError:
         print("[Warn] nibabel not available; skipping NIfTI export.")
@@ -378,7 +415,7 @@ def get_layer_data(model: torch.nn.Module, volume: np.ndarray, patch_size: int =
 # -----------------------------
 
 def main():
-    base_output = Path("cloud_models/MihaiB-dev/suppression-loss_threshold-on-gauss-5")
+    base_output = Path("cloud_models/RusnacAM/AMR_003")
     history_path = base_output / "history.pickle"
     output_folder = base_output
 
@@ -396,7 +433,7 @@ def main():
         print(f"[Warn] Could not pick positive/negative series IDs for inference examples: {e}")
         pos_id, neg_id = None, None
 
-    ckpt_candidates = list(base_output.glob("40_MihaiB-dev_suppression-loss_threshold-on-gauss-5.pt"))
+    ckpt_candidates = list(base_output.glob("40_RusnacAM_AMR_003.pt"))
     if ckpt_candidates and pos_id and neg_id:
         print(f"[Info] Using checkpoint {ckpt_candidates[0]} for inference examples.")
         cfg = InferenceConfig(
