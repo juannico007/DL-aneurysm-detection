@@ -1,3 +1,4 @@
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -57,7 +58,7 @@ def get_up_layer(
     if up_mode == 'transposed':
         return nn.ConvTranspose3d(in_channels,out_channels, kernel_size=kernel_size, stride=stride)
     else:
-        return nn.Upsample(scale_factor=0.2, mode=up_mode)
+        return nn.Upsample(scale_factor=2, mode=up_mode, align_corners=False)
     
 def get_maxpool_layer(
     kernel_size: int = 2,
@@ -403,6 +404,54 @@ class ClassifierBlock(nn.Module):
         y = self.fc2(y)
         self.activations.append(y)
         return y
+
+class RegressionBlock(nn.Module):
+    """
+    Regression block to predict 3D coordinates (z, y, x).
+    
+    Parameters:
+        in_channels: Number of input channels
+        middle_neurons: Number of neurons in the middle layer
+        drop: Dropout rate
+        activation: Activation function name
+    Returns:
+        3D coordinates normalized to [0, 1]
+    """
+    def __init__(
+        self,
+        in_channels: int,
+        middle_neurons: int,
+        drop: float,
+        activation: str = 'relu'
+    ):
+        super().__init__()
+        self.in_channels = in_channels
+        self.middle_neurons = middle_neurons
+        self.drop = drop
+        self.activation = activation
+
+        self.gap = nn.AdaptiveAvgPool3d(1)
+        self.fc1 = nn.Linear(self.in_channels, self.middle_neurons)
+        self.act1 = get_activation(self.activation)
+        self.dropout = nn.Dropout(self.drop)
+        self.fc2 = nn.Linear(self.middle_neurons, 3)  # Output 3 coordinates (z, y, x)
+
+    def initialize_classifier(self):
+        nn.init.kaiming_uniform_(self.fc1.weight, a=0, mode='fan_in', nonlinearity='relu')
+        nn.init.zeros_(self.fc1.bias)
+        nn.init.xavier_uniform_(self.fc2.weight)
+        nn.init.zeros_(self.fc2.bias)
+
+    def forward(self, encoded_features):
+        y = self.gap(encoded_features)
+        y = y.view(y.size(0), -1)
+
+        y = self.fc1(y)
+        y = self.act1(y)
+        y = self.dropout(y)
+        y = self.fc2(y)
+        y = torch.sigmoid(y)  # Bound to [0, 1] for relative coordinates
+        return y
     
 class UNet(nn.Module):
     """
@@ -420,6 +469,7 @@ class UNet(nn.Module):
         middle_neurons: number of middle neurons for classifier block
         class_output: number of output neurons in the classifier
         dropout: dropout rate in the classifier
+        regression: whether to use regression head for coordinate prediction
     Returns:
         Final output feature map.
     """
@@ -437,6 +487,7 @@ class UNet(nn.Module):
         class_output: int = 1,
         dropout: float = 0,
         attention: bool = False,
+        regression: bool = False,
     ):
         super().__init__()
 
@@ -452,6 +503,7 @@ class UNet(nn.Module):
         self.class_outputs = class_output
         self.dropout = dropout
         self.attention = attention
+        self.regression = regression
 
         self.down_blocks = []
         self.up_blocks = []
@@ -474,7 +526,7 @@ class UNet(nn.Module):
 
             self.down_blocks.append(down_block)
 
-        #Auxiliary classifier
+        # Auxiliary classifier
         if self.middle_neurons:
             num_channels = self.start_filters * (2 ** (self.n_blocks-1))
             self.class_block = ClassifierBlock(in_channels=num_channels, 
@@ -483,6 +535,15 @@ class UNet(nn.Module):
                                             drop=self.dropout,
                                             activation=self.activation)
             self.class_block.initialize_classifier()
+
+        # Auxiliary regression (NEW)
+        if self.regression:
+            num_channels = self.start_filters * (2 ** (self.n_blocks-1))
+            self.reg_block = RegressionBlock(in_channels=num_channels,
+                                            middle_neurons=self.middle_neurons,
+                                            drop=self.dropout,
+                                            activation=self.activation)
+            self.reg_block.initialize_classifier()
 
         # Decoder
         for i in range(n_blocks - 1):
@@ -549,6 +610,13 @@ class UNet(nn.Module):
         else:
             class_output = torch.tensor([0], device=x.device)
 
+        # Regression output (NEW)
+        if self.regression:
+            with torch.autocast(device_type='cuda', enabled=False):
+                reg_output = self.reg_block(x)
+        else:
+            reg_output = torch.tensor([0], device=x.device)
+
         for i, module in enumerate(self.up_blocks):
             before_pool = self.encoder_output[-(i + 2)]
             x = module(before_pool, x)
@@ -559,4 +627,4 @@ class UNet(nn.Module):
         self.activations.append(x)
 
         
-        return x, class_output
+        return x, class_output, reg_output
