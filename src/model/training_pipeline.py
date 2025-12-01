@@ -685,9 +685,26 @@ class TrainingPipeline:
         self._configure_scheduler()
         
         history = {
-            "train_loss": [], "train_acc": [], "train_sensitivity": [], "train_ppv": [], "train_npv": [],
-            "val_loss": [], "val_acc": [], "val_sensitivity": [], "val_ppv": [], "val_npv": [],
-            "train_dice": [], "val_dice": []
+            "train_loss": [], 
+            "train_acc": [], 
+            "train_sensitivity": [], 
+            "train_ppv": [], 
+            "train_npv": [],
+            "train_fpr": [],
+            "train_specificity": [],
+            "train_fnr": [],
+            "train_mse": [],
+            "val_loss": [], 
+            "val_acc": [], 
+            "val_sensitivity": [], 
+            "val_ppv": [], 
+            "val_npv": [],
+            "train_dice": [], 
+            "val_dice": [],
+            "val_fpr": [],
+            "val_specificity": [],
+            "val_fnr": [],
+            "val_mse": [],
         }
         
         best_val_loss = float("inf")
@@ -700,6 +717,7 @@ class TrainingPipeline:
             self.model.train()
             train_losses = []
             train_dice_scores = []
+            train_mse_scores = [] 
             train_core_list, train_peak_list, train_focus_list = [], [], []
             all_preds, all_labels = [], []
             train_neg_mean_list, train_neg_max_list = [], []
@@ -817,6 +835,8 @@ class TrainingPipeline:
                 with torch.no_grad():
                     mask_probs = torch.sigmoid(outputs[0].detach().to(torch.float32))
                     targets = mask_batch[:, self.primary_heatmap_index:self.primary_heatmap_index+1].detach().to(torch.float32)
+                    mse_value = F.mse_loss(mask_probs, targets).item()
+                    train_mse_scores.append(mse_value)
                     pos_mask = (y_batch.squeeze(1) > 0.5)
                     if pos_mask.any():
                         mask_probs_pos = mask_probs[pos_mask]
@@ -887,6 +907,8 @@ class TrainingPipeline:
                 train_peak_list.append(peak_err)
                 train_focus_list.append(focus_scores)
 
+            train_mse_mean = np.mean(train_mse_scores)
+            
             #DICE loss stats
             train_dice_scores = torch.cat(train_dice_scores, dim=0).to(self.device, dtype=torch.float32)
             train_dice_scores = self._safe_gather(train_dice_scores)
@@ -924,15 +946,21 @@ class TrainingPipeline:
             fp = np.logical_and(train_preds_np == 1, train_labels_np == 0).sum()
             fn = np.logical_and(train_preds_np == 0, train_labels_np == 1).sum()
             train_acc = (tp + tn) / max(len(train_labels_np), 1)
-            train_sens = tp / max(tp + fn, 1)  # sensitivity/recall
-            train_ppv = tp / max(tp + fp, 1)   # precision/PPV
-            train_npv = tn / max(tn + fn, 1)   # NPV
+            train_sens = tp / max(tp + fn, 1)          # sensitivity/recall
+            train_ppv = tp / max(tp + fp, 1)           # precision/PPV
+            train_npv = tn / max(tn + fn, 1)           # NPV
+            train_fpr = fp / max(tn + fp, 1)           # false positive rate
+            train_specificity = tn / max(tn + fp, 1)   # true negative rate
+            train_fnr = fn / max(fn + tp, 1)           # false positive rate
 
             history["train_loss"].append(np.mean(train_losses))
             history["train_acc"].append(train_acc)
             history["train_sensitivity"].append(train_sens)
             history["train_ppv"].append(train_ppv)
             history["train_npv"].append(train_npv)
+            history["train_fpr"].append(train_fpr)
+            history["train_specificity"].append(train_specificity)
+            history["train_fnr"].append(train_fnr)
             history["train_dice"].append(train_dice_mean)
             
             # Track individual task losses (use safe mean to avoid numpy warnings)
@@ -954,6 +982,7 @@ class TrainingPipeline:
             self.model.eval()
             val_losses = []
             val_dice_scores = []
+            val_mse_list = []
             val_preds_list, val_labels_list = [], []
             with torch.no_grad():
                 val_losses = []
@@ -1033,7 +1062,9 @@ class TrainingPipeline:
                     intersection = (mask_probs * targets).sum(dim=(1, 2, 3, 4))
                     dice = (2.0 * intersection + eps) / (pred_sum + target_sum + eps)
                     val_dice_scores.append(dice)
-
+                    
+                    val_mse_value = F.mse_loss(mask_probs, targets)
+                    val_mse_list.append(val_mse_value)
                     # Auxiliary metrics
                     if targets_pos is not None:
                         tgt_bin = (targets_pos >= 0.1).float()
@@ -1101,6 +1132,9 @@ class TrainingPipeline:
             val_dice_scores = torch.cat(val_dice_scores, dim=0).to(self.device, dtype=torch.float32)
             val_dice_scores = self._safe_gather(val_dice_scores)
             val_dice_mean = val_dice_scores.cpu().numpy().mean() if val_dice_scores.numel() > 0 else 0.0
+            val_mse_tensor = torch.stack(val_mse_list).to(self.device, dtype=torch.float32)
+            val_mse_tensor = self._safe_gather(val_mse_tensor)
+            val_mse_mean = val_mse_tensor.cpu().numpy().mean() if val_mse_tensor.numel() > 0 else 0.0
             # Validation auxiliary metrics
             core_all = torch.cat(val_core_list, dim=0).to(self.device, dtype=torch.float32) if val_core_list else torch.tensor([], device=self.device)
             peak_all = torch.cat(val_peak_list, dim=0).to(self.device, dtype=torch.float32) if val_peak_list else torch.tensor([], device=self.device)
@@ -1129,6 +1163,10 @@ class TrainingPipeline:
             val_sens = tp / max(tp + fn, 1)
             val_ppv = tp / max(tp + fp, 1)
             val_npv = tn / max(tn + fn, 1)
+            val_fpr = fp / max(tn + fp, 1)         
+            val_specificity = tn / max(tn + fp, 1)   
+            val_fnr = fn / max(fn + tp, 1)
+            val_loss = np.mean(val_losses)
             
             # Calculate mean task losses (use safe mean to avoid numpy warnings)
             val_seg_loss_mean = sum(val_seg_losses) / len(val_seg_losses) if val_seg_losses else 0.0
@@ -1142,6 +1180,9 @@ class TrainingPipeline:
             history["val_sensitivity"].append(val_sens)
             history["val_ppv"].append(val_ppv)
             history["val_npv"].append(val_npv)
+            history["val_fpr"].append(val_fpr)
+            history["val_specificity"].append(val_specificity)
+            history["val_fnr"].append(val_fnr)
             history["val_dice"].append(val_dice_mean)
             history.setdefault("val_seg_loss", []).append(val_seg_loss_mean)
             history.setdefault("val_cls_loss", []).append(val_cls_loss_mean)
@@ -1184,22 +1225,21 @@ class TrainingPipeline:
                 self.accelerator.print(f"{'='*150}")
                 
                 # Metrics table
-                self.accelerator.print(f"{'':8} | {'TotalLoss':>9} | {'SegLoss':>8} | {'ClsLoss':>8} | {'CoordLoss':>9} | {'Acc':>6} | {'Sens':>6} | {'PPV':>6} | {'NPV':>6} | {'Dice':>6} | {'Core':>6} | {'Peak':>6} | {'Focus':>6} | {'NegMean':>7} | {'NegMax':>7}")
+                self.accelerator.print(f"{'':8} | {'TotalLoss':>9} | {'SegLoss':>8} | {'ClsLoss':>8} | {'CoordLoss':>9} | {'Acc':>6} | {'Sens':>6} | {'FPR':>6} | {'Spec':>6} | {'FNR':>6} | {'PPV':>6} | {'NPV':>6} | {'Dice':>6} | {'Core':>6} | {'Peak':>6} | {'Focus':>6} | {'NegMean':>7} | {'NegMax':>7}")
                 self.accelerator.print(f"{'-'*150}")
                 self.accelerator.print(
                     f"{'Train':8} | {train_total_loss_mean:9.4f} | {train_seg_loss_mean:8.4f} | {train_cls_loss_mean:8.4f} | {train_coord_loss_mean:9.4f} | "
-                    f"{train_acc:6.4f} | {train_sens:6.4f} | {train_ppv:6.4f} | {train_npv:6.4f} | "
+                    f"{train_acc:6.4f} | {train_sens:6.4f} | {train_fpr:6.4f} | {train_specificity:6.4f} | {train_fnr:6.4f} | {train_ppv:6.4f} | {train_npv:6.4f} | "
                     f"{train_dice_mean:6.4f} | {train_core_dice_mean:6.4f} | {train_peak_mean:6.2f} | "
                     f"{train_focus_mean:6.4f} | {train_neg_prob_mean:7.4f} | {train_neg_prob_max:7.4f}"
                 )
                 self.accelerator.print(
                     f"{'Val':8} | {val_total_loss_mean:9.4f} | {val_seg_loss_mean:8.4f} | {val_cls_loss_mean:8.4f} | {val_coord_loss_mean:9.4f} | "
-                    f"{val_acc:6.4f} | {val_sens:6.4f} | {val_ppv:6.4f} | {val_npv:6.4f} | "
+                    f"{val_acc:6.4f} | {val_sens:6.4f} | {val_fpr:6.4f} | {val_specificity:6.4f} | {val_fnr:6.4f} | {val_ppv:6.4f} | {val_npv:6.4f} | "
                     f"{val_dice_mean:6.4f} | {val_core_dice_mean:6.4f} | {val_peak_mean:6.2f} | "
                     f"{val_focus_mean:6.4f} | {val_neg_prob_mean:7.4f} | {val_neg_prob_max:7.4f}"
                 )
                 self.accelerator.print(f"{'='*150}\n")
-
             
 
             epoch_metrics = {

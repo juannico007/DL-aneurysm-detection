@@ -1,0 +1,71 @@
+{
+  "artifact_id": "RusnacAM_AMR_003",
+  "cli_args": {
+    "batch_size": 10,
+    "data_dir": "train_dataset.h5",
+    "epochs": 40,
+    "grad_accum": 2,
+    "heatmap_decay": {
+      "factor": 0.8,
+      "metric": "val_peak_err",
+      "min_sigma": 5.0,
+      "mode": "min",
+      "threshold": 12.0
+    },
+    "heatmap_sigma": 20,
+    "input_shape": [
+      256,
+      256,
+      256
+    ],
+    "learning_rate": 0.001,
+    "loss_weights": {
+      "classification": 0.2,
+      "segmentation": 0.8,
+      "suppress": 0.15,
+      "suppress_alpha": 3.0,
+      "suppress_eps": 0.001,
+      "suppress_tau": 0.1
+    },
+    "lr_reduction_epochs": 10,
+    "max_voxels": 125000000,
+    "mode": "local",
+    "neg_warmup_epochs": 5,
+    "patch_csv": "train_patches.csv",
+    "proportion_to_use": 1.0,
+    "radius": 5,
+    "scheduler": {
+      "factor": 0.5,
+      "min_lr": 1e-06,
+      "mode": "min",
+      "name": "plateau",
+      "patience": 4
+    },
+    "train_ratio": 0.7,
+    "unet": {
+      "activation": "relu",
+      "attention": true,
+      "class_output": 1,
+      "conv_mode": "same",
+      "dropout": 0.1,
+      "in_channels": 1,
+      "middle_neurons": 256,
+      "n_blocks": 5,
+      "normalization": "group4",
+      "out_channels": 1,
+      "start_filters": 32,
+      "up_mode": "transposed"
+    },
+    "weight_decay": 0.001
+  },
+  "files": {
+    "checkpoint": "RusnacAM_AMR_003.pt",
+    "history": "history.pickle",
+    "hyperparameters": "hyperparameters.json"
+  },
+  "github_user": "RusnacAM",
+  "model_name": "AMR",
+  "model_version": "003",
+  "timestamp": "2025-11-29T22:29:47.088884Z",
+  "training_job_name": "local-run"
+}

@@ -182,6 +182,8 @@ class GridAttentionBlock(nn.Module):
         y = sigm_psi_f.expand_as(x) * x
         wy = self.W(y)
 
+        self.last_attention = sigm_psi_f
+        
         return wy, sigm_psi_f
     
     def init_weights(self):
