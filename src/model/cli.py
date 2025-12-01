@@ -32,7 +32,7 @@ HYPERPARAMS = {
         "neg_ramp_epochs": 20,
         "alpha_min": 0.05,
         "alpha_schedule": "cosine",
-        "coord_scaler": 20.0,
+        "coord_scaler": 10.0,
     },
     "neg_warmup_epochs": 0,
     "heatmap_sigma": 5,
@@ -44,7 +44,7 @@ HYPERPARAMS = {
         # For plateau mode:
         "metric": "val_loss",
         "mode": "min",      # or "max"
-        "patience": 10,
+        "patience": 6,
         "factor": 0.9,
         # For threshold mode:
         # "metric": "val_peak_err",

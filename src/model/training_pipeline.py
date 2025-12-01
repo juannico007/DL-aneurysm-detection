@@ -2,6 +2,7 @@ from torch.nn import utils
 from .unet import UNet
 from torch.utils.data import Dataset, DataLoader
 import math
+import gc
 import torch.optim as optim
 import torch.nn as nn
 import torch
@@ -536,7 +537,7 @@ class TrainingPipeline:
         self.seg_weight = float(lw.get("segmentation", 1.0))
         self.cls_weight = float(lw.get("classification", 0.5))
         self.coord_weight = float(lw.get("coordinates", 1.0))
-        self.coord_scaler = float(lw.get("coord_scaler", 100.0)) # Pre-scaling for coordinate loss
+        # self.coord_scaler = float(lw.get("coord_scaler", 100.0)) # Pre-scaling for coordinate loss
         self.background_weight = float(lw.get("background", 0.1))
         
         self.neg_warmup_epochs = int(neg_warmup_epochs)
@@ -806,7 +807,7 @@ class TrainingPipeline:
                             
                             # Use the pre-scaled MSE for the coordinate task loss
                             # This brings the magnitude closer to other losses for MTL stability
-                            loss_dict["coordinates"] = masked_mse_raw * self.coord_scaler
+                            loss_dict["coordinates"] = masked_mse_raw 
                             
                         loss = self.multi_task_loss(loss_dict)
 
@@ -1035,7 +1036,7 @@ class TrainingPipeline:
                             masked_mse_raw = (mse_loss * mask).sum() / (mask.sum() + 1e-6)
                             masked_mse_logged = (scaled_mse * mask).sum() / (mask.sum() + 1e-6)
                             
-                            loss_dict["coordinates"] = masked_mse_raw * self.coord_scaler
+                            loss_dict["coordinates"] = masked_mse_raw
                             
                         loss = self.multi_task_loss(loss_dict)
                         
@@ -1276,6 +1277,13 @@ class TrainingPipeline:
             for k, v in mtl_weights.items():
                 epoch_metrics[k] = v
             self.accelerator.log(epoch_metrics, step=epoch)
+            
+            # Clear GPU cache to prevent memory fragmentation slowdowns
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            # Force garbage collection to prevent memory buildup
+            gc.collect()
+
 
             unwrapped_wrapper = self.accelerator.unwrap_model(self.wrapper)
             unwrapped = unwrapped_wrapper.model
