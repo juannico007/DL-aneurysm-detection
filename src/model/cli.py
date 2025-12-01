@@ -14,7 +14,7 @@ MODE_ENV_VAR = "TRAINING_MODE"
 HYPERPARAMS = {
     "data_dir": "train_dataset.h5",
     "patch_csv": "train_patches.csv",
-    "proportion_to_use": 0.1,
+    "proportion_to_use": 0.5,
     "input_shape": (256, 256, 256),
     "batch_size": 20,
     "grad_accum": 2,
@@ -32,6 +32,7 @@ HYPERPARAMS = {
         "neg_ramp_epochs": 20,
         "alpha_min": 0.05,
         "alpha_schedule": "cosine",
+        "coord_scaler": 20.0,
     },
     "neg_warmup_epochs": 0,
     "heatmap_sigma": 5,
