@@ -235,3 +235,5 @@ datasets/
 .idea/
 .DS_Store
 Thumbs.db
+ssh_key
+ssh_key.pub
