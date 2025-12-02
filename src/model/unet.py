@@ -370,7 +370,8 @@ class ClassifierBlock(nn.Module):
         out_neurons: int,
         middle_neurons: int,
         drop: float,
-        activation: str = 'relu'
+        activation: str = 'relu',
+        legacy: bool = False
     ):
         super().__init__()
 
@@ -379,18 +380,27 @@ class ClassifierBlock(nn.Module):
         self.out_neurons = out_neurons
         self.drop = drop
         self.activation = activation
-
+        self.legacy = legacy
+    
         self.gap = nn.AdaptiveAvgPool3d(1)
         self.fc1 = nn.Linear(self.in_channels, self.middle_neurons)
         self.act1 = get_activation(self.activation)
         self.dropout = nn.Dropout(self.drop)
-        self.fc2 = nn.Linear(self.middle_neurons, self.out_neurons)
+        if self.legacy:
+            self.fc2 = nn.Linear(self.middle_neurons, self.out_neurons)
+        else:
+            self.fc2 = nn.Linear(self.middle_neurons, self.middle_neurons // 4)
+            self.act2 = get_activation(self.activation)
+            self.fc3 = nn.Linear(self.middle_neurons // 4, self.out_neurons) 
 
     def initialize_classifier(self):
         nn.init.kaiming_uniform_(self.fc1.weight, a=0, mode='fan_in', nonlinearity='relu')
         nn.init.zeros_(self.fc1.bias)
         nn.init.kaiming_uniform_(self.fc2.weight, a=0, mode='fan_in', nonlinearity='relu')
         nn.init.zeros_(self.fc2.bias)
+        if not self.legacy:
+            nn.init.kaiming_uniform_(self.fc3.weight, a=0, mode='fan_in', nonlinearity='relu')
+            nn.init.zeros_(self.fc3.bias)
 
     def forward(self, encoded_features):
         self.activations = []
@@ -403,6 +413,10 @@ class ClassifierBlock(nn.Module):
         y = self.dropout(y)
         y = self.fc2(y)
         self.activations.append(y)
+        if not self.legacy:
+            y = self.act2(y)
+            y = self.dropout(y)
+            y = self.fc3(y)
         return y
 
 class RegressionBlock(nn.Module):
@@ -422,25 +436,36 @@ class RegressionBlock(nn.Module):
         in_channels: int,
         middle_neurons: int,
         drop: float,
-        activation: str = 'relu'
+        activation: str = 'relu',
+        legacy: bool = False
     ):
         super().__init__()
         self.in_channels = in_channels
         self.middle_neurons = middle_neurons
         self.drop = drop
         self.activation = activation
+        self.legacy = legacy
 
         self.gap = nn.AdaptiveAvgPool3d(1)
         self.fc1 = nn.Linear(self.in_channels, self.middle_neurons)
         self.act1 = get_activation(self.activation)
         self.dropout = nn.Dropout(self.drop)
-        self.fc2 = nn.Linear(self.middle_neurons, 3)  # Output 3 coordinates (z, y, x)
+        if self.legacy:
+            self.fc2 = nn.Linear(self.middle_neurons, 3)  # Output 3 coordinates (z, y, x)
+        else:
+            self.act2 = get_activation(self.activation)
+            self.fc2 = nn.Linear(self.middle_neurons, self.middle_neurons // 4)
+            self.act3 = get_activation(self.activation)
+            self.fc3 = nn.Linear(self.middle_neurons // 4, 3)
 
     def initialize_classifier(self):
         nn.init.kaiming_uniform_(self.fc1.weight, a=0, mode='fan_in', nonlinearity='relu')
         nn.init.zeros_(self.fc1.bias)
         nn.init.xavier_uniform_(self.fc2.weight)
         nn.init.zeros_(self.fc2.bias)
+        if not self.legacy:
+            nn.init.xavier_uniform_(self.fc3.weight)
+            nn.init.zeros_(self.fc3.bias)
 
     def forward(self, encoded_features):
         y = self.gap(encoded_features)
@@ -450,6 +475,9 @@ class RegressionBlock(nn.Module):
         y = self.act1(y)
         y = self.dropout(y)
         y = self.fc2(y)
+        if not self.legacy:
+            y = self.act2(y)
+            y = self.fc3(y)
         y = torch.sigmoid(y)  # Bound to [0, 1] for relative coordinates
         return y
     
@@ -488,6 +516,7 @@ class UNet(nn.Module):
         dropout: float = 0,
         attention: bool = False,
         regression: bool = False,
+        legacy: bool = False
     ):
         super().__init__()
 
@@ -504,6 +533,7 @@ class UNet(nn.Module):
         self.dropout = dropout
         self.attention = attention
         self.regression = regression
+        self.legacy = legacy
 
         self.down_blocks = []
         self.up_blocks = []
@@ -533,7 +563,8 @@ class UNet(nn.Module):
                                             out_neurons=self.class_outputs, 
                                             middle_neurons=self.middle_neurons,
                                             drop=self.dropout,
-                                            activation=self.activation)
+                                            activation=self.activation,
+                                            legacy=self.legacy)
             self.class_block.initialize_classifier()
 
         # Auxiliary regression (NEW)
@@ -542,7 +573,8 @@ class UNet(nn.Module):
             self.reg_block = RegressionBlock(in_channels=num_channels,
                                             middle_neurons=self.middle_neurons,
                                             drop=self.dropout,
-                                            activation=self.activation)
+                                            activation=self.activation,
+                                            legacy=self.legacy)
             self.reg_block.initialize_classifier()
 
         # Decoder

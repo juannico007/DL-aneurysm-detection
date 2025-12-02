@@ -1,8 +1,7 @@
 from torch.nn import utils
 from .unet import UNet
+from .data_augmentation import DataAugmentation, rotate_batch_gpu
 from torch.utils.data import Dataset, DataLoader
-import math
-import gc
 import torch.optim as optim
 import torch.nn as nn
 import torch
@@ -18,7 +17,7 @@ import pandas as pd
 import csv
 from dataclasses import dataclass
 import h5py
-from model.data_augmentation import DataAugmentation, augment_batch_gpu
+import math
 
 class MultiTaskLoss(nn.Module):
     def __init__(self, tasks: List[str]):
@@ -537,10 +536,11 @@ class TrainingPipeline:
         self.seg_weight = float(lw.get("segmentation", 1.0))
         self.cls_weight = float(lw.get("classification", 0.5))
         self.coord_weight = float(lw.get("coordinates", 1.0))
-        # self.coord_scaler = float(lw.get("coord_scaler", 100.0)) # Pre-scaling for coordinate loss
         self.background_weight = float(lw.get("background", 0.1))
         
         self.neg_warmup_epochs = int(neg_warmup_epochs)
+        # Default ramp epochs if not provided (though we expect it from CLI now)
+        # If neg_ramp_epochs is passed in loss_weights or kwargs, use it, else default to remaining epochs
         self.neg_ramp_epochs = int(lw.get("neg_ramp_epochs", max(1, self.epochs - self.neg_warmup_epochs)))
         self.alpha_min = float(lw.get("alpha_min", 0.05))
         self.alpha_schedule = lw.get("alpha_schedule", "cosine")
@@ -554,12 +554,14 @@ class TrainingPipeline:
             gradient_accumulation_steps=grad_accum_steps
         )
         
+        # Initialize loss function
         self.criterion = UnifiedCurriculumDice(
             beta=self.beta, 
             lambda_tail=self.lambda_tail,
             lambda_max=self.lambda_max
         )
 
+        # Identify active tasks for Multi-Task Learning
         self.tasks = ["segmentation"]
         if self.cls_weight > 0:
             self.tasks.append("classification")
@@ -569,6 +571,7 @@ class TrainingPipeline:
         self.multi_task_loss = MultiTaskLoss(self.tasks)
 
     def _sigma_for_epoch(self, epoch: int) -> float:
+        """Compute decayed sigma rounded to int, reducing by 1 every `heatmap_decay_epoch` epochs."""
         interval = self.heatmap_decay_epoch
         if not interval or interval <= 0:
             return self.initial_heatmap_sigma
@@ -577,15 +580,25 @@ class TrainingPipeline:
         return max(self.heatmap_min_sigma, decayed)
 
     def _maybe_decay_heatmap(self, epoch: int):
+        """Shrink sigma gradually after the configured epoch, rounded to int."""
         cfg = self.heatmap_decay_config
         name = cfg.get("name", "epoch")
         if name == "epoch":
             new_sigma = self._sigma_for_epoch(epoch)
             if new_sigma != self.current_heatmap_sigma:
                 self.accelerator.print(f"[Heatmap] Sigma update at epoch {epoch}: {self.current_heatmap_sigma} -> {new_sigma}")
-                self.current_heatmap_sigma = new_sigma
+                self._set_heatmap_sigma(new_sigma)
+        elif name == "plateau":
+            # handled in training loop after validation using metrics
+            return
+        elif name == "threshold":
+            # handled in training loop after validation using metrics
+            return
+        else:
+            return
 
     def _neg_penalty_scale(self, epoch: int) -> float:
+        """Gaussian ramp from 0 to 1 after warmup for negative suppression terms."""
         if self.neg_ramp_epochs <= 0:
             return 1.0
         t = (epoch - self.neg_warmup_epochs) / max(1, self.neg_ramp_epochs)
@@ -593,38 +606,126 @@ class TrainingPipeline:
         return math.exp(-5.0 * (1.0 - t) * (1.0 - t))
 
     def _get_current_alpha(self, epoch: int) -> float:
+        """Calculate alpha for the current epoch based on the curriculum schedule."""
+        # 1. Warmup phase
         if epoch <= self.neg_warmup_epochs:
             return self.alpha_max
+            
+        # 2. Ramp phase
+        # Epochs since warmup ended (1-based index relative to ramp start)
         ramp_step = epoch - self.neg_warmup_epochs
+        
         if ramp_step > self.neg_ramp_epochs:
+            # 3. Stabilization phase
             return self.alpha_min
+            
+        # Calculate progress t from 0 to 1
         t = (ramp_step - 1) / max(1, self.neg_ramp_epochs - 1)
         t = min(max(t, 0.0), 1.0)
+        
         if self.alpha_schedule == "cosine":
+            # Cosine decay from 1 to 0
             decay = 0.5 * (1.0 + math.cos(t * math.pi))
         else:
+            # Linear decay (fallback)
             decay = 1.0 - t
+            
+        # Map decay (1->0) to alpha (alpha_max -> alpha_min)
         return self.alpha_min + (self.alpha_max - self.alpha_min) * decay
 
+    def _maybe_decay_heatmap_dynamic(self, metrics: Dict[str, float], epoch: int):
+        cfg = self.heatmap_decay_config
+        name = cfg.get("name", "epoch")
+        if name == "plateau":
+            metric_name = cfg.get("metric", "val_loss")
+            mode = cfg.get("mode", "min")
+            patience = int(cfg.get("patience", 3))
+            factor = float(cfg.get("factor", 0.5))
+            if not hasattr(self, "_hd_best"):
+                self._hd_best = None
+                self._hd_wait = 0
+            current = metrics.get(metric_name)
+            if current is None:
+                return
+            if self._hd_best is None:
+                self._hd_best = current
+                self._hd_wait = 0
+                return
+            improved = (current < self._hd_best) if mode == "min" else (current > self._hd_best)
+            if improved:
+                self._hd_best = current
+                self._hd_wait = 0
+            else:
+                self._hd_wait += 1
+                if self._hd_wait >= patience:
+                    new_sigma = max(self.current_heatmap_sigma * factor, self.heatmap_min_sigma)
+                    if new_sigma < self.current_heatmap_sigma:
+                        self.accelerator.print(f"[Heatmap] Plateau decay at epoch {epoch}: {self.current_heatmap_sigma} -> {new_sigma}")
+                        self.current_heatmap_sigma = new_sigma
+                    self._hd_wait = 0
+        elif name == "threshold":
+            metric_name = cfg.get("metric", "val_peak_err_series")
+            mode = cfg.get("mode", "min")
+            thresh = float(cfg.get("threshold", 0.0))
+            factor = float(cfg.get("factor", 0.5))
+            current = metrics.get(metric_name)
+            if current is None:
+                return
+            hit = (current <= thresh) if mode == "min" else (current >= thresh)
+            if hit:
+                new_sigma = max(self.current_heatmap_sigma * factor, self.heatmap_min_sigma)
+                if new_sigma < self.current_heatmap_sigma:
+                    self.accelerator.print(f"[Heatmap] Threshold decay at epoch {epoch}: {self.current_heatmap_sigma} -> {new_sigma}")
+                    self.current_heatmap_sigma = new_sigma
+
     def compute_background_penalty(self, pred, target, input_volume):
+        """
+        Compute penalty for high predictions on background voxels.
+        
+        Args:
+            pred: (B, 1, D, H, W) - predicted probabilities
+            target: (B, 1, D, H, W) - ground truth mask
+            input_volume: (B, 1, D, H, W) - z-scored input volume
+            
+        Returns:
+            background_penalty: scalar tensor
+        """
+        # Identify background: z-scored values < 0
         background_mask = (input_volume < 0).float()
+        
+        # Only consider true background (not in ground truth)
         true_background = background_mask * (1 - target)
+        
+        # Penalize high predictions on background
         if true_background.sum() > 0:
             background_penalty = (pred * true_background).sum() / (true_background.sum() + 1e-6)
         else:
             background_penalty = torch.tensor(0.0, device=pred.device)
+            
         return background_penalty
 
-    def create_dataloaders(self, h5_path, patch_csv, train_ratio=None, split_seed=None, records=None):
+    def create_dataloaders(
+        self,
+        h5_path: Path,
+        patch_csv: Path,
+        train_ratio: Optional[float] = None,
+        split_seed: Optional[int] = None,
+        records: Optional[List[PatchRecord]] = None,
+    ) -> Tuple[DataLoader, DataLoader]:
+        """
+        Create PyTorch DataLoaders from patch metadata.
+        """
         if patch_csv is None and records is None and self.patch_csv is None:
-            raise ValueError("patch_csv or records must be provided")
+            raise ValueError("patch_csv or records must be provided for patch-based training.")
         patch_csv = patch_csv or self.patch_csv
         train_ratio = train_ratio if train_ratio is not None else self.train_ratio
         split_seed = split_seed if split_seed is not None else self.split_seed
 
         if records is None:
             records = load_patch_records(Path(patch_csv))
-        
+        if not records:
+            raise ValueError(f"No patch records found in {patch_csv}")
+
         rng = np.random.default_rng(split_seed)
         indices = np.arange(len(records))
         rng.shuffle(indices)
@@ -639,52 +740,197 @@ class TrainingPipeline:
         pos = train_labels.sum()
         neg = len(train_labels) - pos
         if pos == 0:
-            self.pos_weight = torch.tensor(1.0)
+            pos_weight = torch.tensor(1.0)
         else:
-            self.pos_weight = torch.tensor(neg / max(pos, 1), dtype=torch.float32)
+            pos_weight = torch.tensor(neg / max(pos, 1), dtype=torch.float32)
+        self.pos_weight = pos_weight
 
-        train_transforms = transforms.Compose([DataAugmentation.augment_training])
-        val_transforms = transforms.Compose([DataAugmentation.prepare_validation])
+        train_transforms = transforms.Compose([
+            DataAugmentation.augment_training
+        ])
+        val_transforms = transforms.Compose([
+            DataAugmentation.prepare_validation
+        ])
 
-        train_dataset = PatchAneurysmDataset(h5_path, train_records, self.patch_size, train_transforms, self.radius, self.heatmap_sizes)
-        val_dataset = PatchAneurysmDataset(h5_path, val_records, self.patch_size, val_transforms, self.radius, self.heatmap_sizes)
+        train_dataset = PatchAneurysmDataset(
+            h5_path=h5_path,
+            records=train_records,
+            patch_size=self.patch_size,
+            transform=train_transforms,
+            radius=self.radius,
+            heatmap_sizes=self.heatmap_sizes,
+        )
+        val_dataset = PatchAneurysmDataset(
+            h5_path=h5_path,
+            records=val_records,
+            patch_size=self.patch_size,
+            transform=val_transforms,
+            radius=self.radius,
+            heatmap_sizes=self.heatmap_sizes,
+        )
 
-        train_loader = DataLoader(train_dataset, batch_size=self.batch_size, shuffle=True, num_workers=0, pin_memory=True, collate_fn=pad_collate_3d)
-        val_loader = DataLoader(val_dataset, batch_size=self.batch_size, shuffle=True, num_workers=0, pin_memory=True, collate_fn=pad_collate_3d)
-        
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=self.batch_size,
+            shuffle=True,
+            num_workers=0,
+            pin_memory=True,
+            collate_fn=pad_collate_3d,
+        )
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=self.batch_size,
+            shuffle=True,
+            num_workers=0,
+            pin_memory=True,
+            collate_fn=pad_collate_3d,
+        )
         self.train_loader, self.val_loader = self.accelerator.prepare(train_loader, val_loader)
         return self.train_loader, self.val_loader
 
     def _configure_scheduler(self):
+        """Create the requested LR scheduler and remember how it should be stepped."""
         config = dict(self.scheduler_config) if self.scheduler_config else {}
         name = config.get("name", "step")
-        if not name or name in {"none", "off"}:
+        if not name:
             self.scheduler = None
+            self.scheduler_step_mode = None
+            self.scheduler_name = None
             return
-        
+
+        name = name.lower()
+        self.scheduler_name = name
+        if name in {"none", "off"}:
+            self.scheduler = None
+            self.scheduler_step_mode = None
+            return
+
         if name == "step":
-            self.scheduler = optim.lr_scheduler.StepLR(self.optimizer, step_size=int(config.get("step_size", 100)), gamma=float(config.get("gamma", 0.96)))
+            step_size = int(config.get("step_size", 100))
+            gamma = float(config.get("gamma", 0.96))
+            self.scheduler = optim.lr_scheduler.StepLR(
+                self.optimizer,
+                step_size=step_size,
+                gamma=gamma,
+            )
             self.scheduler_step_mode = "epoch"
         elif name == "cosine":
-            self.scheduler = optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=int(config.get("T_max", self.epochs)), eta_min=float(config.get("eta_min", 1e-6)))
+            t_max = int(config.get("T_max", self.epochs))
+            eta_min = float(config.get("eta_min", 1e-6))
+            self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
+                self.optimizer,
+                T_max=t_max,
+                eta_min=eta_min,
+            )
             self.scheduler_step_mode = "epoch"
-
+        elif name in {"plateau", "reduce_on_plateau"}:
+            factor = float(config.get("factor", 0.5))
+            patience = int(config.get("patience", 10))
+            min_lr = float(config.get("min_lr", 1e-6))
+            mode = config.get("mode", "min")
+            self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+                self.optimizer,
+                mode=mode,
+                factor=factor,
+                patience=patience,
+                min_lr=min_lr,
+            )
+            self.scheduler_step_mode = "plateau"
+        elif name in {"onecycle", "one_cycle"}:
+            if not hasattr(self, "train_loader"):
+                raise ValueError("OneCycleLR scheduler requires dataloaders to be created before training.")
+            steps_per_epoch = int(config.get("steps_per_epoch", len(self.train_loader)))
+            epochs = int(config.get("epochs", self.epochs))
+            max_lr = float(config.get("max_lr", self.learning_rate))
+            self.scheduler = optim.lr_scheduler.OneCycleLR(
+                self.optimizer,
+                max_lr=max_lr,
+                steps_per_epoch=steps_per_epoch,
+                epochs=epochs,
+            )
+            self.scheduler_step_mode = "batch"
+        else:
+            raise ValueError(f"Unsupported scheduler '{name}'.")
+    
     def _safe_gather(self, tensor):
-        return self.accelerator.gather(tensor)
-
-    def train(self) -> dict:
-        self.device = self.accelerator.device
-        self.wrapper = TrainingWrapper(self.model, self.multi_task_loss)
-        self.optimizer = bnb.optim.Adam8bit(self.wrapper.parameters(), lr=self.learning_rate, betas=(0.9, 0.999), eps=1e-8, weight_decay=self.weight_decay)
+        """Safely gather tensors across processes for Gloo backend."""
+        tensor = tensor.flatten().contiguous()
         
-        cls_pos_weight = getattr(self, "pos_weight", torch.tensor(1.0)).to(self.device)
+        # Get max size across processes
+        local_size = torch.tensor(tensor.shape[0], device=self.device)
+        all_sizes = self.accelerator.gather(local_size)
+        if not torch.is_tensor(all_sizes):
+            all_sizes = torch.tensor([all_sizes], device=self.device)
+        else:
+            all_sizes = all_sizes.to(self.device)
+        max_size = all_sizes.max().item() if all_sizes.numel() else 0
+        
+        # Pad to max size
+        current_size = tensor.shape[0]
+        if current_size < max_size:
+            tensor = torch.nn.functional.pad(tensor, (0, max_size - current_size), value=0)
+
+        gathered = self.accelerator.gather(tensor)
+
+        if max_size == 0:
+            return gathered
+
+        sizes_list = all_sizes.tolist()
+        if isinstance(sizes_list, (int, float)):
+            sizes_list = [sizes_list]
+        masks = [
+            (torch.arange(max_size, device=self.device) < size)
+            for size in sizes_list
+        ]
+        valid_mask = torch.stack(masks, dim=0).flatten()
+        return gathered[valid_mask]
+    
+    def train(
+        self,
+    ) -> dict:
+        """Run the training loop using the loaders prepared beforehand."""
+        # # Check if GPU available
+        # if torch.cuda.is_available():
+        #     print("GPU is on")
+        #     self.device = "cuda"
+        #     self.model = self.model.to("cuda")
+
+        self.device = self.accelerator.device
+
+        # Wrap model and multi_task_loss together for DeepSpeed compatibility
+        self.wrapper = TrainingWrapper(self.model, self.multi_task_loss)
+        
+        self.optimizer = bnb.optim.Adam8bit(
+            self.wrapper.parameters(), 
+            lr=self.learning_rate,
+            betas = (0.9, 0.999),
+            eps=1e-8,
+            weight_decay=self.weight_decay)
+
+        
+        self.criterion = UnifiedCurriculumDice(
+            beta=self.beta,
+            lambda_tail=self.lambda_tail
+        )
+        
+        cls_pos_weight = getattr(self, "pos_weight", torch.tensor(1.0))
+        cls_pos_weight = cls_pos_weight.to(self.device)
         self.classification_loss = nn.BCEWithLogitsLoss(pos_weight=cls_pos_weight)
         
-        self.wrapper, self.optimizer = self.accelerator.prepare(self.wrapper, self.optimizer)
+        self.wrapper, self.optimizer = self.accelerator.prepare(
+            self.wrapper, self.optimizer
+        )
+        # Update references to point to wrapped components
         self.model = self.wrapper.model
         self.multi_task_loss = self.wrapper.multi_task_loss
         self._configure_scheduler()
-        
+        #Since we have to define our own training loop, we have to keep track
+        #of these variables for best model, early stopping and learning rate decrease
+        best_val_loss = float("inf")
+        epochs_no_improve = 0
+        lr_plateau_counter = 0
+
+        #Also we want to keep track of our training history
         history = {
             "train_loss": [], 
             "train_acc": [], 
@@ -707,13 +953,18 @@ class TrainingPipeline:
             "val_fnr": [],
             "val_mse": [],
         }
-        
-        best_val_loss = float("inf")
-        epochs_no_improve = 0
 
+        eps = 1e-6
         for epoch in range(1, self.epochs + 1):
             self._maybe_decay_heatmap(epoch)
             current_alpha = self._get_current_alpha(epoch)
+            # Get current MTL weights for display
+            mtl_info = []
+            for task, param in self.multi_task_loss.log_vars.items():
+                weight = torch.exp(-param).item()
+                mtl_info.append(f"{task}={weight:.4f}")
+            mtl_str = ", ".join(mtl_info)
+            self.accelerator.print(f"Epoch {epoch}: Alpha = {current_alpha:.4f}, Sigma = {self.current_heatmap_sigma:.1f}, Weights: [{mtl_str}]")
             
             self.model.train()
             train_losses = []
@@ -724,36 +975,20 @@ class TrainingPipeline:
             train_neg_mean_list, train_neg_max_list = [], []
             train_seg_losses, train_cls_losses, train_coord_losses = [], [], []
             train_total_losses = []
-            eps = 1e-6
-            
             for x_batch, mask_batch, y_batch, coord_batch in tqdm(self.train_loader):
                 x_batch = x_batch.to(self.device, dtype=torch.float16, non_blocking=True)
                 mask_batch = mask_batch.to(self.device, dtype=torch.float16, non_blocking=True)
-                y_batch = y_batch.float().unsqueeze(1).to(self.device, dtype=torch.float16, non_blocking=True)
-                coord_batch = coord_batch.to(self.device, dtype=torch.float32, non_blocking=True)
+                y_batch = y_batch.float().unsqueeze(1)
+                y_batch = y_batch.to(self.device, dtype=torch.float16, non_blocking=True)
+                coord_batch = coord_batch.to(self.device, dtype=torch.float32, non_blocking=True) # Coords are float32
+                
+                # Note: Rotation augmentation needs to handle coordinates too if we want to be correct.
+                # For now, let's assume no rotation or that we accept the small error if rotation is small.
+                # Ideally, we should rotate the coordinates.
                 # TODO: Implement coordinate rotation.
                 
-                # Apply augmentation (rotation, flip, intensity, noise)
-                # Note: augment_batch_gpu handles coordinate rotation now
-                x_batch, coord_batch, angles, flips = augment_batch_gpu(
-                    x_batch, 
-                    coords=coord_batch, 
-                    flip_prob=0.5, 
-                    intensity_prob=0.5, 
-                    noise_prob=0.1
-                )
-                
-                # Apply SAME geometric augmentation to mask (no intensity/noise)
-                mask_batch, _, _, _ = augment_batch_gpu(
-                    mask_batch, 
-                    coords=None, 
-                    angles=angles, 
-                    flips=flips,
-                    mode='nearest',
-                    flip_prob=0.0, 
-                    intensity_prob=0.0, 
-                    noise_prob=0.0
-                )
+                x_batch, angles = rotate_batch_gpu(x_batch, mode='bilinear')
+                mask_batch, _ = rotate_batch_gpu(mask_batch, angles=angles, mode='nearest')
                 with self.accelerator.accumulate(self.model):
                     with self.accelerator.autocast():
                         outputs = self.model(x_batch)
@@ -792,22 +1027,16 @@ class TrainingPipeline:
                             # Calculate MSE loss per sample
                             mse_loss = F.mse_loss(reg_output, coord_batch, reduction='none').mean(dim=1)
                             
-                            # Scale by patch_size to get voxel-scale errors (for logging only)
-                            scaled_mse = self.patch_size * mse_loss
+                            # Scale by patch_size to get voxel-scale errors
+                            scaled_mse = mse_loss
                             
                             # Masking: Only penalize if label == 1
                             # y_batch is (B, 1)
                             mask = y_batch.squeeze(1)
+                            masked_mse = (scaled_mse * mask).sum() / (mask.sum() + 1e-6)
                             
-                            # Calculate masked MSE (unscaled)
-                            masked_mse_raw = (mse_loss * mask).sum() / (mask.sum() + 1e-6)
-                            
-                            # Calculate masked MSE (scaled by patch size) for logging
-                            masked_mse_logged = (scaled_mse * mask).sum() / (mask.sum() + 1e-6)
-                            
-                            # Use the pre-scaled MSE for the coordinate task loss
-                            # This brings the magnitude closer to other losses for MTL stability
-                            loss_dict["coordinates"] = masked_mse_raw 
+                            # Use the scaled masked_mse for the coordinate task
+                            loss_dict["coordinates"] = masked_mse
                             
                         loss = self.multi_task_loss(loss_dict)
 
@@ -829,7 +1058,7 @@ class TrainingPipeline:
                 if "classification" in loss_dict:
                     train_cls_losses.append(self.accelerator.gather(cls_loss.detach()).mean().item())
                 if "coordinates" in loss_dict:
-                    train_coord_losses.append(self.accelerator.gather(masked_mse_logged.detach()).mean().item())
+                    train_coord_losses.append(self.accelerator.gather(masked_mse.detach()).mean().item())
                 train_total_losses.append(self.accelerator.gather(loss.detach()).mean().item())
 
                 #Dice calculation (soft dice on soft targets)
@@ -1030,13 +1259,11 @@ class TrainingPipeline:
                             mse_loss = F.mse_loss(reg_output, coord_batch, reduction='none').mean(dim=1)
                             
                             # Scale by patch_size to get voxel-scale errors
-                            scaled_mse = self.patch_size * mse_loss
+                            scaled_mse =  mse_loss
                             
                             mask = y_batch.squeeze(1)
-                            masked_mse_raw = (mse_loss * mask).sum() / (mask.sum() + 1e-6)
-                            masked_mse_logged = (scaled_mse * mask).sum() / (mask.sum() + 1e-6)
-                            
-                            loss_dict["coordinates"] = masked_mse_raw
+                            masked_mse = (scaled_mse * mask).sum() / (mask.sum() + 1e-6)
+                            loss_dict["coordinates"] = masked_mse
                             
                         loss = self.multi_task_loss(loss_dict)
                         
@@ -1045,7 +1272,7 @@ class TrainingPipeline:
                     if "classification" in loss_dict:
                         val_cls_losses.append(self.accelerator.gather(cls_loss.detach()).mean().item())
                     if "coordinates" in loss_dict:
-                        val_coord_losses.append(self.accelerator.gather(masked_mse_logged.detach()).mean().item())
+                        val_coord_losses.append(self.accelerator.gather(masked_mse.detach()).mean().item())
                     val_total_losses.append(self.accelerator.gather(loss.detach()).mean().item())
 
                     #DICE loss (soft dice on soft targets)
@@ -1213,13 +1440,6 @@ class TrainingPipeline:
                 # Get current learning rate
                 current_lr = self.optimizer.param_groups[0]["lr"]
                 
-                # Generate MTL weights string for display
-                mtl_info = []
-                for task, param in self.multi_task_loss.log_vars.items():
-                    weight = torch.exp(-param).item()
-                    mtl_info.append(f"{task}={weight:.4f}")
-                mtl_str = ", ".join(mtl_info)
-                
                 # Create table header with dynamic variables
                 self.accelerator.print(f"\n{'='*150}")
                 self.accelerator.print(f"Epoch {epoch}/{self.epochs} | LR: {current_lr:.2e} | Alpha: {current_alpha:.4f} | Sigma: {self.current_heatmap_sigma:.1f} | Weights: [{mtl_str}]")
@@ -1277,13 +1497,6 @@ class TrainingPipeline:
             for k, v in mtl_weights.items():
                 epoch_metrics[k] = v
             self.accelerator.log(epoch_metrics, step=epoch)
-            
-            # Clear GPU cache to prevent memory fragmentation slowdowns
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            # Force garbage collection to prevent memory buildup
-            gc.collect()
-
 
             unwrapped_wrapper = self.accelerator.unwrap_model(self.wrapper)
             unwrapped = unwrapped_wrapper.model
@@ -1304,6 +1517,15 @@ class TrainingPipeline:
             else:
                 epochs_no_improve += 1
 
+            # Dynamic heatmap decay based on metrics/config
+            self._maybe_decay_heatmap_dynamic(
+                {
+                    "val_loss": val_loss,
+                    "val_core_dice": val_core_dice_mean,
+                    "val_peak_err": val_peak_mean,
+                },
+                epoch,
+            )
 
 
             # --- Early stopping ---

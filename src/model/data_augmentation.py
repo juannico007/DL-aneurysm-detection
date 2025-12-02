@@ -24,7 +24,19 @@ class DataAugmentation:
             volume = volume.unsqueeze(0)
         return volume.to(torch.float16)
 
-
+def rotate_batch_gpu(x: torch.Tensor, angles: torch.Tensor = None, mode: str = 'bilinear'):
+    B, C, D, H, W = x.shape
+    if angles is None:
+        angles = torch.empty(B, device=x.device).uniform_(-20, 20) * (math.pi / 180)
+    cos_a, sin_a = torch.cos(angles), torch.sin(angles)
+    theta = torch.zeros(B, 3, 4, device=x.device, dtype=x.dtype)
+    theta[:,0,0] = cos_a;  theta[:,0,1] = -sin_a
+    theta[:,1,0] = sin_a;  theta[:,1,1] =  cos_a
+    theta[:,2,2] = 1.0
+    grid = F.affine_grid(theta, size=x.size(), align_corners=False)
+    x_rot = F.grid_sample(x, grid, mode=mode, padding_mode='zeros', align_corners=False)
+    return x_rot, angles
+    
 def augment_batch_gpu(
     x: torch.Tensor, 
     coords: torch.Tensor = None,
