@@ -27,6 +27,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import torch
+import torch.nn.functional as F
 from tqdm import tqdm
 
 sys.path.append(str(Path(__file__).resolve().parents[1] / "src"))
@@ -40,8 +41,13 @@ from model.training_pipeline import make_heatmaps
 
 # Models to compare - add/remove model directories as needed
 MODEL_CONFIGS = [
-    "cloud_models/RusnacAM/AMR_003",
-    "cloud_models/MihaiB-dev/suppression-loss_threshold-on-gauss-5",
+    "cloud_models/final_models/best_model",
+    "cloud_models/final_models/new-loss-2_curriculum-learning-alpha-5",
+    "cloud_models/final_models/final_002",
+    "cloud_models/final_models/final_005",
+    "cloud_models/final_models/final_006",
+    "cloud_models/final_models/final_009",
+    "cloud_models/final_models/final_004",
 ]
 
 INFERENCE_CONFIG = {
@@ -299,6 +305,8 @@ def run_inference_for_model(
     # Initialize output arrays
     prob_map = np.zeros_like(volume, dtype=np.float32)
     weight_map = np.zeros_like(volume, dtype=np.float32)
+    attention_maps = [np.zeros_like(volume, dtype=np.float32) for _ in model.up_blocks]
+    attention_weights = [np.zeros_like(volume, dtype=np.float32) for _ in model.up_blocks]
     
     # Build weight patch for blending
     weight_patch = build_weight_mask(patch_size, mode=blend_mode)
@@ -339,6 +347,26 @@ def run_inference_for_model(
                 seg_probs = torch.sigmoid(seg_logits.float()).cpu().numpy()[0, 0]
                 prob_map[z:z + patch_size, y:y + patch_size, x:x + patch_size] += seg_probs * weight_patch
                 weight_map[z:z + patch_size, y:y + patch_size, x:x + patch_size] += weight_patch
+
+                # Collect attention maps if available
+                for idx, up_block in enumerate(model.up_blocks):
+                    att = getattr(getattr(up_block, "attention", None), "last_attention", None)
+                    if att is None:
+                        continue
+                    # Ensure shape [1,1,D,H,W]
+                    att_tensor = att
+                    if att_tensor.dim() == 4:
+                        att_tensor = att_tensor.unsqueeze(0)
+                    if att_tensor.shape[2:] != (patch_size, patch_size, patch_size):
+                        att_tensor = F.interpolate(
+                            att_tensor,
+                            size=(patch_size, patch_size, patch_size),
+                            mode="trilinear",
+                            align_corners=False
+                        )
+                    att_np = att_tensor.float().cpu().numpy()[0, 0]
+                    attention_maps[idx][z:z + patch_size, y:y + patch_size, x:x + patch_size] += att_np * weight_patch
+                    attention_weights[idx][z:z + patch_size, y:y + patch_size, x:x + patch_size] += weight_patch
     
     # Normalize by weights
     weight_map[weight_map == 0] = 1.0
@@ -349,6 +377,13 @@ def run_inference_for_model(
         "prob": prob_map,
         "mask": mask,
     }
+
+    normalized_atts = []
+    for att_map, att_w in zip(attention_maps, attention_weights):
+        att_w[att_w == 0] = 1.0
+        normalized_atts.append(att_map / att_w)
+    if any(np.any(att_map) for att_map in normalized_atts):
+        result["attentions"] = normalized_atts
     
     if classification_outputs:
         result["classification"] = np.mean(classification_outputs)
@@ -434,6 +469,183 @@ def plot_segmentation_comparison(
     print(f"[Info] Saved segmentation comparison to {output_path}")
 
 
+def select_false_positive_location(
+    model_results: Dict[str, Dict],
+    gt_heatmap: Optional[np.ndarray] = None,
+    gt_threshold: float = 0.1
+) -> Tuple[Tuple[int, int, int], float]:
+    """
+    Pick a representative false-positive location by averaging model probabilities
+    and selecting the highest voxel away from ground truth.
+    
+    Returns:
+        ((z, y, x), score)
+    """
+    if not model_results:
+        raise ValueError("No model results provided to select false positive")
+    
+    prob_stack = np.stack([res["prob"] for res in model_results.values()], axis=0)
+    mean_prob = np.mean(prob_stack, axis=0)
+    
+    candidate_map = mean_prob.copy()
+    if gt_heatmap is not None:
+        candidate_map = np.where(gt_heatmap < gt_threshold, candidate_map, -np.inf)
+    
+    flat_idx = np.argmax(candidate_map)
+    if candidate_map.flat[flat_idx] == -np.inf:
+        flat_idx = np.argmax(mean_prob)  # fallback if everything overlaps GT
+    
+    z, y, x = np.unravel_index(flat_idx, mean_prob.shape)
+    return (int(z), int(y), int(x)), float(mean_prob[z, y, x])
+
+
+def select_point_for_slice(points: List[Tuple[float, float, float]], target_slice: int) -> Tuple[int, int, int]:
+    """Pick the point whose z is closest to the target slice."""
+    if not points:
+        return (target_slice, 0, 0)
+    closest = min(points, key=lambda p: abs(p[0] - target_slice))
+    z, y, x = closest
+    return int(round(z)), int(round(y)), int(round(x))
+
+
+def plot_false_positive_comparison(
+    model_results: Dict[str, Dict],
+    volume: np.ndarray,
+    slice_idx: int,
+    false_pos_coord: Tuple[int, int, int],
+    output_path: Path,
+    name_map: Optional[Dict[str, str]] = None
+):
+    """Plot only model probability maps at the selected false-positive slice."""
+    n_models = len(model_results)
+    n_cols = min(3, n_models)
+    n_rows = int(np.ceil(n_models / n_cols))
+    
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(3.5 * n_cols, 4.0 * n_rows))
+    axes = np.atleast_1d(axes).flatten()
+    
+    prob_im = None
+    plot_idx = 0
+    for model_name, results in model_results.items():
+        display_name = name_map.get(model_name, model_name) if name_map else model_name
+        ax = axes[plot_idx]
+        prob_slice = results["prob"][slice_idx, :, :]
+        ax.imshow(volume[slice_idx, :, :], cmap='gray')
+        overlay = ax.imshow(prob_slice, cmap='hot', alpha=0.5, vmin=0, vmax=1)
+        if prob_im is None:
+            prob_im = overlay
+        ax.plot(false_pos_coord[2], false_pos_coord[1], 'b+', markersize=15, markeredgewidth=2)
+        ax.set_title(f'{display_name}\nProbabilities', fontsize=10)
+        ax.axis('off')
+        plot_idx += 1
+    
+    for idx in range(plot_idx, len(axes)):
+        axes[idx].axis('off')
+
+    if prob_im is not None:
+        fig.colorbar(prob_im, ax=axes[:plot_idx].tolist(), fraction=0.035, pad=0.16, label='Probability')
+    
+    plt.subplots_adjust(wspace=0.08, hspace=0.12)
+    
+    plt.tight_layout()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"[Info] Saved false-positive comparison to {output_path}")
+
+
+def plot_prob_and_attention_comparison(
+    model_results: Dict[str, Dict],
+    volume: np.ndarray,
+    slice_idx: int,
+    location: Tuple[int, int, int],
+    output_path: Path,
+    extra_points: Optional[List[Tuple[float, float, float]]] = None,
+    point_slice_tol: int = 3,
+    name_map: Optional[Dict[str, str]] = None
+):
+    """
+    Plot per-model probability slice and attention maps at the given location.
+    Rows: probability, then each attention map (if available). Columns: models.
+    """
+    if not model_results:
+        return
+    
+    max_att = 0
+    for res in model_results.values():
+        max_att = max(max_att, len(res.get("attentions", [])))
+    
+    n_rows = 1 + max_att
+    n_model_cols = len(model_results)
+    n_cols = n_model_cols + 2  # label column + colorbar column
+    fig, axes = plt.subplots(
+        n_rows,
+        n_cols,
+        figsize=(3.0 * n_cols, 3.8 * n_rows),
+        gridspec_kw={"width_ratios": [0.35] + [1.0] * n_model_cols + [0.22]}
+    )
+    axes = np.atleast_2d(axes)
+    
+    prob_im = None
+    att_im = None
+    
+    # Label column
+    axes[0, 0].text(0.5, 0.5, "Models", ha='center', va='center', fontsize=12, fontweight='bold')
+    axes[0, 0].axis('off')
+    for row in range(1, n_rows):
+        label = f"Attention {row}"  # will update per-model if available
+        axes[row, 0].text(0.5, 0.5, label, ha='center', va='center', fontsize=11)
+        axes[row, 0].axis('off')
+    
+    for col, (model_name, results) in enumerate(model_results.items()):
+        col_idx = col + 1  # offset for label column
+        display_name = name_map.get(model_name, model_name) if name_map else model_name
+        
+        # Probability row
+        ax_prob = axes[0, col_idx]
+        prob_slice = results["prob"][slice_idx, :, :]
+        ax_prob.imshow(volume[slice_idx, :, :], cmap='gray')
+        im = ax_prob.imshow(prob_slice, cmap='hot', alpha=0.5, vmin=0, vmax=1)
+        if prob_im is None:
+            prob_im = im
+        ax_prob.plot(location[2], location[1], 'b+', markersize=15, markeredgewidth=2)
+        ax_prob.set_title(display_name, fontsize=10)
+        ax_prob.axis('off')
+        
+        # Attention rows
+        attentions = results.get("attentions", [])
+        att_indices = list(range(len(attentions) - 1, -1, -1))  # most detailed (likely last) closest to prob row
+        for row in range(1, n_rows):
+            ax_att = axes[row, col_idx]
+            if row - 1 < len(att_indices):
+                att_idx = att_indices[row - 1]
+                att_map = attentions[att_idx]
+                att_slice = att_map[slice_idx, :, :]
+                im_att = ax_att.imshow(att_slice, cmap='viridis', vmin=0, vmax=1)
+                if att_im is None:
+                    att_im = im_att
+                ax_att.plot(location[2], location[1], 'r.', markersize=8)
+                axes[row, 0].texts[0].set_text(f"Attention {att_idx + 1}")
+            ax_att.axis('off')
+    
+    # Colorbar column (last)
+    cb_col = n_cols - 1
+    for row in range(n_rows):
+        axes[row, cb_col].axis('off')
+    if prob_im is not None:
+        fig.colorbar(prob_im, cax=axes[0, cb_col], label='Probability')
+    if att_im is not None and n_rows > 1:
+        fig.colorbar(att_im, cax=axes[1, cb_col], label='Attention')
+    
+    plt.subplots_adjust(wspace=0.05, hspace=0.12, left=0.05, right=0.98)
+    
+    plt.tight_layout()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"[Info] Saved probability+attention comparison to {output_path}")
+
+
 def create_3d_overlay(
     volume: np.ndarray,
     prob_map: np.ndarray,
@@ -493,7 +705,8 @@ def create_3d_overlay(
 def plot_metric_comparison(
     histories: Dict[str, Dict],
     metric: str,
-    output_path: Path
+    output_path: Path,
+    name_map: Optional[Dict[str, str]] = None
 ):
     """Plot a single metric comparison across all models."""
     fig, ax = plt.subplots(figsize=(10, 6))
@@ -501,13 +714,14 @@ def plot_metric_comparison(
     colors = plt.cm.tab10(np.linspace(0, 1, len(histories)))
     
     for idx, (model_name, history) in enumerate(histories.items()):
+        display_name = name_map.get(model_name, model_name) if name_map else model_name
         train_key = f"train_{metric}"
         val_key = f"val_{metric}"
         
         if train_key in history:
             epochs = range(1, len(history[train_key]) + 1)
             ax.plot(epochs, history[train_key], 
-                   label=f"{model_name} (train)", 
+                   label=f"{display_name} (train)", 
                    color=colors[idx], 
                    linestyle='-', 
                    linewidth=2)
@@ -515,7 +729,7 @@ def plot_metric_comparison(
         if val_key in history:
             epochs = range(1, len(history[val_key]) + 1)
             ax.plot(epochs, history[val_key], 
-                   label=f"{model_name} (val)", 
+                   label=f"{display_name} (val)", 
                    color=colors[idx], 
                    linestyle='--', 
                    linewidth=2)
@@ -533,7 +747,8 @@ def plot_metric_comparison(
 
 def plot_all_metrics_comparison(
     histories: Dict[str, Dict],
-    output_dir: Path
+    output_dir: Path,
+    name_map: Optional[Dict[str, str]] = None
 ):
     """Generate comparison plots for all available metrics."""
     # Find all available metrics
@@ -551,7 +766,7 @@ def plot_all_metrics_comparison(
     
     for metric in sorted(all_metrics):
         output_path = metrics_dir / f"{metric}_comparison.png"
-        plot_metric_comparison(histories, metric, output_path)
+        plot_metric_comparison(histories, metric, output_path, name_map=name_map)
         print(f"  Generated {metric}_comparison.png")
 
 
@@ -641,6 +856,7 @@ def main():
     # Generate visualizations
     print("\n[Step 6] Generating visualizations...")
     output_dir = Path(INFERENCE_CONFIG["output_dir"])
+    name_map = {m.name: m.hyperparams.get("description", m.name) for m in models}
     
     # Segmentation comparison at aneurysm slice
     if model_results:
@@ -652,6 +868,42 @@ def main():
             output_dir / f"segmentation_comparison_{patient_id[:20]}.png",
             aneurysm_points
         )
+        
+        # False-positive comparison (probability maps only)
+        false_pos_coord, false_pos_score = select_false_positive_location(model_results, gt_heatmap)
+        print(f"  False-positive candidate at (z={false_pos_coord[0]}, y={false_pos_coord[1]}, x={false_pos_coord[2]}) "
+              f"with mean prob={false_pos_score:.4f}")
+        plot_false_positive_comparison(
+            model_results,
+            volume,
+            slice_idx=false_pos_coord[0],
+            false_pos_coord=false_pos_coord,
+            output_path=output_dir / f"segmentation_comparison_false_positive_prob-{false_pos_score:.4f}_{patient_id[:20]}.png",
+            name_map=name_map
+        )
+
+        # Probability + attention comparison at false-positive slice
+        plot_prob_and_attention_comparison(
+            model_results,
+            volume,
+            slice_idx=false_pos_coord[0],
+            location=false_pos_coord,
+            output_path=output_dir / f"prob_attention_false_positive_prob-{false_pos_score:.4f}_{patient_id[:20]}.png",
+            name_map=name_map
+        )
+
+        # Probability + attention comparison at aneurysm slice (if GT available)
+        if aneurysm_points:
+            center_point = select_point_for_slice(aneurysm_points, aneurysm_slice)
+            plot_prob_and_attention_comparison(
+                model_results,
+                volume,
+                slice_idx=aneurysm_slice,
+                location=center_point,
+                output_path=output_dir / f"prob_attention_aneurysm_{patient_id[:20]}.png",
+                extra_points=aneurysm_points,
+                name_map=name_map
+            )
         
         # Create 3D overlays for each model
         overlay_dir = output_dir / "3d_overlays"
@@ -669,7 +921,7 @@ def main():
     print("\n[Step 7] Generating metrics comparison plots...")
     histories = {model.name: model.history for model in models if model.history}
     if histories:
-        plot_all_metrics_comparison(histories, output_dir)
+        plot_all_metrics_comparison(histories, output_dir, name_map=name_map)
     else:
         print("  No histories available for comparison")
     
