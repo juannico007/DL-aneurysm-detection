@@ -42,3 +42,8 @@ python3 -m preprocessing.cli
 - We added batch processing to allow multiple series to be processed simultaneously on one core, and also added a thread pool to each core, while also giving more threads to heavy series.
 
 For example, we can have a batch size of 3, with 5 workers (processes), and each worker can have 6 threads. This means that at most 15 series can be processed simultaneously, with each series using up to 6 threads for processing. This configuration can significantly speed up the preprocessing time, especially for large datasets.
+
+
+- After this, we decided to use exclusively CTA images for the first stage of the project, making the dataset significantly smalles, lowering from 300gb to 120gb. This also allows us to make a more tailored preprocess and model.
+- Thus, we added to the preprocessing an extra step, an adaptative histogram equalization over the volumes that enchances the contrast of the images, showing better some structures of the brain for the model to recognize them easier. This equalization is done after cropping and before normalization
+- Also, to ensure the same size for every image, we changed the isotropic resampling for a one that keeps the patient volumes dimension in 256x256x256. And we eliminated the head cropping to ensure consistency in shapes.

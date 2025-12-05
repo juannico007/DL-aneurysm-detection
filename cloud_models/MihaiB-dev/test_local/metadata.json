@@ -1,0 +1,30 @@
+{
+  "artifact_id": "MihaiB-dev_test_002",
+  "cli_args": {
+    "batch_size": 2,
+    "csv_path": "train.csv",
+    "data_dir": "h5-aneurysm",
+    "epochs": 1,
+    "grad_accum": 4,
+    "input_shape": [
+      256,
+      256,
+      256
+    ],
+    "learning_rate": 0.0001,
+    "lr_reduction_epochs": 4,
+    "mode": "local",
+    "radius": 15,
+    "train_ratio": 0.7
+  },
+  "files": {
+    "checkpoint": "MihaiB-dev_test_002.pt",
+    "history": "history.pickle",
+    "hyperparameters": "hyperparameters.json"
+  },
+  "github_user": "MihaiB-dev",
+  "model_name": "test",
+  "model_version": "002",
+  "timestamp": "2025-11-16T10:39:42.338928Z",
+  "training_job_name": "local-run"
+}

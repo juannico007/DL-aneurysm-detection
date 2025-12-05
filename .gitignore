@@ -184,7 +184,7 @@ pyrightconfig.json
 *.ckpt.*
 *.h5
 *.pth
-*.pt
+# *.pt (Now we accept all the models on the github repo)
 *.tflite
 *.onnx
 *.pb
@@ -225,6 +225,8 @@ datasets/
 *.nii
 *.nii.gz
 *.dcm
+*.nii.npy
+*.npz
 
 # ------------------------
 # IDE & OS
@@ -233,3 +235,5 @@ datasets/
 .idea/
 .DS_Store
 Thumbs.db
+ssh_key
+ssh_key.pub

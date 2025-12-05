@@ -1,10 +1,15 @@
-# Core scientific stack
-numpy>=1.23
-pandas>=1.5
-
-# Medical imaging IO and resampling
-itk>=5.3
-
-# Visualisation and progress helpers
-matplotlib>=3.6
-tqdm>=4.64
+accelerate>=1.11.0
+bitsandbytes>=0.48.1
+itk>=5.4.4.post1
+matplotlib>=3.10.7
+numpy>=2.3.4
+pandas>=2.3.3
+scikit_learn>=1.7.2
+scipy>=1.16.2
+scikit-image>=0.0
+torch>=2.9.0
+torchsummary>=1.5.1
+torchvision>=0.24.0
+tqdm>=4.67.1
+transformers>=4.46
+boto3>=1.35.30
